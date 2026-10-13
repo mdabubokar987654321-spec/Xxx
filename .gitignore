@@ -1,0 +1,29 @@
+node_modules/
+dist/
+
+# Never commit secrets — use .env.example and set .env locally
+.env
+.env.local
+.env.*.local
+
+.DS_Store
+*.log
+
+# Frontend bundle — tracked so git-pull deploys (e.g. GCP) get UI updates without esbuild on server.
+# Rebuild after src/frontend changes: npm run build:frontend
+public/token-picker.js
+
+# Stray file
+npm
+
+# Debug artifacts
+debug-*.json
+
+# Runtime token icon/meta cache (catalog icons live in public/data/token-icons/)
+data/token-icons/
+data/token-meta-cache.json
+
+# Keep locally only (removed from repo)
+deploy/
+scripts/
+DEPLOY.md

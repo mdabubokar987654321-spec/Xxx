@@ -1,0 +1,2795 @@
+/**
+ * Token picker modal — catalog from token-catalog.tsv + local device cache for searches.
+ */
+
+import { WALLET_TOKEN_BALANCE_LIMIT } from '../wallet-balance-limit.js';
+
+export interface TokenMeta {
+  mint: string;
+  symbol: string;
+  name: string;
+  logoUrl: string;
+  decimals?: number;
+  price?: number;
+  price1d?: number;
+  price7d?: number;
+  priceUpdateTime?: number;
+  priceFetchedAt?: number;
+  tags?: string[];
+  organicScore?: number;
+  isVerified?: boolean;
+  source: 'catalog' | 'search';
+  savedAt: number;
+}
+
+export type PriceResolveSource = 'Vybe' | 'Jupiter' | 'Pumpfun-API';
+
+/** Session resolve-prices TTL — skip refetch when stats are this fresh (ms). */
+export const RESOLVE_PRICES_TTL_MS = 2000;
+
+export interface TokenPriceStats {
+  mint?: string;
+  price: number;
+  price1d?: number;
+  price7d?: number;
+  decimals: number;
+  priceFetchedAt: number;
+  priceUpdateTime?: number;
+  source?: PriceResolveSource;
+  responseTimeMs?: number;
+  logoUrl?: string;
+  symbol?: string;
+  name?: string;
+  isVerified?: boolean;
+  organicScore?: number;
+  tokenProgram?: string;
+  marketCapUsd?: number;
+  liquidityUsd?: number;
+  poolAddress?: string;
+  bondingCurveAddress?: string;
+  programAddress?: string;
+  quoteMintAddress?: string;
+  complete?: boolean;
+  description?: string;
+  twitter?: string;
+  website?: string;
+  isBanned?: boolean;
+  pumpfunStatus?: string;
+  creatorAddress?: string;
+}
+
+export type TokenPickerSide = 'input' | 'output';
+
+export interface WalletBalanceListItem {
+  mintAddress: string;
+  symbol: string;
+  name: string;
+  logoUrl: string | null;
+  decimals: number;
+  amountUi: number;
+  /** Raw base-unit balance (integer string). */
+  amountExact?: string;
+  valueUsd: number;
+  /** Set when Jupiter quoted to WSOL; convert to USD with cached SOL price. */
+  valueSol?: number;
+  verified: boolean;
+  /** True while server-side Vybe/Jupiter enrichment is still running. */
+  enrichmentPending?: boolean;
+}
+
+const CACHE_KEY = 'vybe-swap-token-cache-v1';
+const RECENT_KEY = 'vybe-swap-token-recent-v1';
+/** Mints where wallet phase-2 /api/token enrichment failed — persisted locally. */
+const WALLET_ENRICH_GIVEUP_KEY = 'vybe-wallet-enrich-giveup-v1';
+const WALLET_ENRICH_GIVEUP_TTL_MS = 183 * 24 * 60 * 60 * 1000; // ~6 months
+/** Phase 2: only enrich the top N wallet rows by on-chain token amount. */
+const WALLET_ENRICH_MAX = 10;
+/** Phase 2: stagger /api/token fetches (ms between requests). */
+const WALLET_ENRICH_INTERVAL_MS = 1000;
+const MAX_RECENT = 24;
+const CATALOG_JSON_URL = '/data/token-catalog.json';
+const CATALOG_TSV_URL = '/data/token-catalog.tsv';
+const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+let catalogTokens: TokenMeta[] = [];
+let catalogLoaded = false;
+let activeSide: TokenPickerSide = 'input';
+let activeTab: 'top' | 'recent' | 'wallet' = 'top';
+let searchQuery = '';
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingMintLookup: string | null = null;
+
+let dialogEl: HTMLDialogElement | null = null;
+let searchInputEl: HTMLInputElement | null = null;
+let listEl: HTMLElement | null = null;
+let shortcutsEl: HTMLElement | null = null;
+let walletBalancesEl: HTMLElement | null = null;
+let walletBalancesListEl: HTMLElement | null = null;
+let tabsEl: HTMLElement | null = null;
+let listWrapEl: HTMLElement | null = null;
+let listHeadEl: HTMLElement | null = null;
+let searchWrapEl: HTMLElement | null = null;
+let walletTabEl: HTMLElement | null = null;
+let topTabEl: HTMLElement | null = null;
+let statusEl: HTMLElement | null = null;
+let onSelectCb: ((mint: string, side: TokenPickerSide) => void) | null = null;
+let getWalletAddressCb: (() => string) | null = null;
+let getSwapInputMintCb: (() => string) | null = null;
+let getSwapInputSymbolCb: (() => string) | null = null;
+let canOpenSellPickerCb: (() => boolean) | null = null;
+let canOpenBuyPickerCb: (() => boolean) | null = null;
+let onRefetchHoldingsCb: (() => void | Promise<void>) | null = null;
+let getWalletHoldingsFetchingCb: (() => boolean) | null = null;
+
+let refetchHoldingsBtn: HTMLButtonElement | null = null;
+let refetchHoldingsTimerEl: HTMLElement | null = null;
+let refetchHoldingsCooldownEndsAt = 0;
+let refetchHoldingsCooldownRaf = 0;
+let refetchHoldingsInFlight = false;
+const REFETCH_HOLDINGS_COOLDOWN_SEC = 15;
+
+let bodyScrollLockActive = false;
+let savedBodyOverflow = '';
+let savedHtmlOverflow = '';
+let savedBodyPaddingRight = '';
+
+export function lockPageScroll(): void {
+  if (bodyScrollLockActive) return;
+  bodyScrollLockActive = true;
+  savedBodyOverflow = document.body.style.overflow;
+  savedHtmlOverflow = document.documentElement.style.overflow;
+  savedBodyPaddingRight = document.body.style.paddingRight;
+  const scrollBarWidth = window.innerWidth - document.documentElement.clientWidth;
+  document.documentElement.classList.add('token-picker-scroll-lock');
+  document.body.classList.add('token-picker-scroll-lock');
+  document.documentElement.style.overflow = 'hidden';
+  document.body.style.overflow = 'hidden';
+  if (scrollBarWidth > 0) {
+    document.body.style.paddingRight = `${scrollBarWidth}px`;
+  }
+}
+
+export function unlockPageScroll(): void {
+  if (!bodyScrollLockActive) return;
+  bodyScrollLockActive = false;
+  document.documentElement.classList.remove('token-picker-scroll-lock');
+  document.body.classList.remove('token-picker-scroll-lock');
+  document.documentElement.style.overflow = savedHtmlOverflow;
+  document.body.style.overflow = savedBodyOverflow;
+  document.body.style.paddingRight = savedBodyPaddingRight;
+}
+
+function isInsideTokenPickerShell(target: EventTarget | null): boolean {
+  if (!dialogEl || target == null) return false;
+  const shell = dialogEl.querySelector('.token-picker-shell');
+  return Boolean(shell && target instanceof Node && shell.contains(target));
+}
+
+function preventBackgroundScroll(event: Event): void {
+  if (!dialogEl?.open) return;
+  if (isInsideTokenPickerShell(event.target)) return;
+  event.preventDefault();
+}
+
+/** Latest wallet balances for this page session (Vybe + RPC only — never persisted to disk). */
+let sessionWalletBalances: { wallet: string; fetchedAt: number; items: WalletBalanceListItem[] } | null =
+  null;
+let walletBalanceStreamAbort: AbortController | null = null;
+let walletEnrichAbort: AbortController | null = null;
+let walletBalanceStreamListener: (() => void) | null = null;
+
+/** Called after each streamed wallet balance chunk (initial + per-RPC-only update). */
+export function setWalletBalanceStreamListener(fn: (() => void) | null): void {
+  walletBalanceStreamListener = fn;
+}
+
+function notifyWalletBalanceStream(): void {
+  walletBalanceStreamListener?.();
+}
+
+function mergeWalletBalanceUpdate(token: WalletBalanceListItem): void {
+  if (!sessionWalletBalances) return;
+  const items = sessionWalletBalances.items.filter((i) => i.mintAddress !== token.mintAddress);
+  items.push(token);
+  sessionWalletBalances.items = sortWalletBalancesForDisplay(items);
+}
+
+function sortWalletBalancesForDisplay(items: WalletBalanceListItem[]): WalletBalanceListItem[] {
+  return sortWalletBalanceList(items, { demoteUntradableSell: false });
+}
+
+function isDustWalletItem(item: WalletBalanceListItem): boolean {
+  if (isNativeSolMint(item.mintAddress)) {
+    return item.amountUi < SOL_MIN_TRADABLE_TOTAL_UI;
+  }
+  if (isWsolMint(item.mintAddress)) return false;
+  return !isSplValueTradable(walletItemValueUsd(item));
+}
+
+function sortWalletBalanceList(
+  items: WalletBalanceListItem[],
+  options: { demoteUntradableSell: boolean },
+): WalletBalanceListItem[] {
+  return [...items].sort((a, b) => {
+    const aDust = isDustWalletItem(a);
+    const bDust = isDustWalletItem(b);
+    if (aDust !== bDust) return aDust ? 1 : -1;
+    if (options.demoteUntradableSell) {
+      const aDemote = shouldDemoteWalletBalanceInSort(a.mintAddress);
+      const bDemote = shouldDemoteWalletBalanceInSort(b.mintAddress);
+      if (aDemote !== bDemote) return aDemote ? 1 : -1;
+    }
+    return walletItemValueUsd(b) - walletItemValueUsd(a) || b.amountUi - a.amountUi;
+  });
+}
+
+async function consumeWalletBalanceStream(
+  wallet: string,
+  res: Response,
+): Promise<WalletBalanceListItem[]> {
+  if (!res.ok || !res.body) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error || `Wallet balances failed (${res.status})`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let items: WalletBalanceListItem[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const msg = JSON.parse(trimmed) as
+        | { event: 'initial'; tokens: WalletBalanceListItem[] }
+        | { event: 'update'; token: WalletBalanceListItem }
+        | { event: 'done' };
+      if (msg.event === 'initial') {
+        items = sortWalletBalancesForDisplay(
+          Array.isArray(msg.tokens) ? msg.tokens : [],
+        );
+        sessionWalletBalances = { wallet, fetchedAt: Date.now(), items };
+        notifyWalletBalanceStream();
+        void enrichWalletItemsOnClient(items);
+      } else if (msg.event === 'update') {
+        mergeWalletBalanceUpdate(msg.token);
+        items = sessionWalletBalances?.items ?? items;
+        notifyWalletBalanceStream();
+      }
+    }
+  }
+
+  return sessionWalletBalances?.items ?? items;
+}
+
+function walletItemStillIncomplete(item: WalletBalanceListItem): boolean {
+  if (item.enrichmentPending) return true;
+  const sym = item.symbol?.trim();
+  const mint = item.mintAddress.trim();
+  if (!sym || isMintLikeLabel(sym, mint)) return true;
+  const url = resolveTokenLogoUrl(mint) ?? item.logoUrl?.trim();
+  if (!url || effectiveTokenIconSrc(url) === TOKEN_ICON_PLACEHOLDER_PATH) return true;
+  if (!(walletItemValueUsd(item) > 0)) return true;
+  return false;
+}
+
+function readWalletEnrichGiveUp(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(WALLET_ENRICH_GIVEUP_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, number>;
+    if (!parsed || typeof parsed !== 'object') return {};
+    const now = Date.now();
+    const out: Record<string, number> = {};
+    for (const [mint, ts] of Object.entries(parsed)) {
+      if (typeof ts === 'number' && now - ts < WALLET_ENRICH_GIVEUP_TTL_MS) out[mint] = ts;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeWalletEnrichGiveUp(map: Record<string, number>): void {
+  localStorage.setItem(WALLET_ENRICH_GIVEUP_KEY, JSON.stringify(map));
+}
+
+function isWalletEnrichGiveUp(mint: string): boolean {
+  return Boolean(readWalletEnrichGiveUp()[mint.trim()]);
+}
+
+function markWalletEnrichGiveUp(mint: string): void {
+  const map = readWalletEnrichGiveUp();
+  map[mint.trim()] = Date.now();
+  writeWalletEnrichGiveUp(map);
+}
+
+function clearWalletEnrichGiveUp(mints?: string[]): void {
+  if (!mints?.length) {
+    localStorage.removeItem(WALLET_ENRICH_GIVEUP_KEY);
+    return;
+  }
+  const map = readWalletEnrichGiveUp();
+  for (const mint of mints) delete map[mint.trim()];
+  writeWalletEnrichGiveUp(map);
+}
+
+function walletItemNeedsClientEnrichment(item: WalletBalanceListItem): boolean {
+  const mint = item.mintAddress.trim();
+  if (isWalletEnrichGiveUp(mint)) return false;
+  return walletItemStillIncomplete(item);
+}
+
+function applyMetaToWalletItem(
+  item: WalletBalanceListItem,
+  meta: TokenMeta,
+): WalletBalanceListItem {
+  const price = typeof meta.price === 'number' && meta.price > 0 ? meta.price : undefined;
+  let valueUsd = item.valueUsd;
+  let valueSol = item.valueSol;
+  if (price != null && !(valueUsd > 0)) {
+    valueUsd = price * item.amountUi;
+    valueSol = undefined;
+  }
+  const mint = item.mintAddress.trim();
+  const symbolFallback = truncateMint(mint);
+  const session = getSessionTokenPriceStats(mint);
+  return {
+    ...item,
+    symbol: pickTokenLabel([meta.symbol, session?.symbol, item.symbol], mint, symbolFallback),
+    name: pickTokenLabel([meta.name, session?.name, item.name, meta.symbol], mint, symbolFallback),
+    logoUrl: meta.logoUrl?.trim() || item.logoUrl,
+    decimals: meta.decimals ?? item.decimals,
+    verified: meta.isVerified ?? item.verified,
+    valueUsd,
+    valueSol,
+    enrichmentPending: false,
+  };
+}
+
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const id = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(id);
+        reject(new DOMException('Aborted', 'AbortError'));
+      },
+      { once: true },
+    );
+  });
+}
+
+/** Client-side phase 2: logos, symbols, and USD values via GET /api/token. */
+async function enrichWalletItemsOnClient(items: WalletBalanceListItem[]): Promise<void> {
+  walletEnrichAbort?.abort();
+  const ac = new AbortController();
+  walletEnrichAbort = ac;
+
+  const targets = items
+    .filter((i) => !isBlockedPickerMint(i.mintAddress) && walletItemNeedsClientEnrichment(i))
+    .sort((a, b) => b.amountUi - a.amountUi)
+    .slice(0, WALLET_ENRICH_MAX);
+
+  if (targets.length === 0) return;
+
+  for (let i = 0; i < targets.length; i++) {
+    if (ac.signal.aborted) return;
+    const item = targets[i];
+    const mint = item.mintAddress.trim();
+    const meta = await fetchTokenByMint(mint, { skipVybe: true });
+    if (ac.signal.aborted) return;
+    const updated = meta
+      ? applyMetaToWalletItem(item, meta)
+      : { ...item, enrichmentPending: false };
+    if (!meta || walletItemStillIncomplete(updated)) {
+      markWalletEnrichGiveUp(mint);
+    } else {
+      clearWalletEnrichGiveUp([mint]);
+    }
+    mergeWalletBalanceUpdate(updated);
+    notifyWalletBalanceStream();
+
+    if (i < targets.length - 1) {
+      try {
+        await sleepMs(WALLET_ENRICH_INTERVAL_MS, ac.signal);
+      } catch {
+        return;
+      }
+    }
+  }
+
+  refreshWalletBalancesPanel();
+  if (dialogEl?.open) renderShortcuts();
+}
+
+export function clearSessionWalletBalances(): void {
+  walletBalanceStreamAbort?.abort();
+  walletBalanceStreamAbort = null;
+  walletEnrichAbort?.abort();
+  walletEnrichAbort = null;
+  sessionWalletBalances = null;
+}
+
+async function fetchWalletBalances(wallet: string): Promise<WalletBalanceListItem[]> {
+  const w = wallet.trim();
+  clearSessionWalletBalances();
+  const ac = new AbortController();
+  walletBalanceStreamAbort = ac;
+
+  const res = await fetch(
+    `/api/wallets/${encodeURIComponent(w)}/token-balances?limit=${WALLET_TOKEN_BALANCE_LIMIT}&stream=1&_=${Date.now()}`,
+    { signal: ac.signal, cache: 'no-store' },
+  );
+  const items = await consumeWalletBalanceStream(w, res);
+  return sessionWalletBalances?.items ?? items;
+}
+
+/** @deprecated Renamed to amountExceedsWalletBalance */
+export const amountExceedsCachedWalletBalance = amountExceedsWalletBalance;
+
+export function prefetchWalletBalances(wallet: string): Promise<WalletBalanceListItem[]> {
+  return fetchWalletBalances(wallet.trim());
+}
+
+function readCache(): Record<string, TokenMeta> {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, TokenMeta>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCache(cache: Record<string, TokenMeta>): void {
+  localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+}
+
+function readRecent(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((m) => typeof m === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeRecent(mints: string[]): void {
+  localStorage.setItem(RECENT_KEY, JSON.stringify(mints.slice(0, MAX_RECENT)));
+}
+
+function mergeCatalogWithDeviceCache(fromCatalog: TokenMeta, cached: TokenMeta): TokenMeta {
+  const mint = fromCatalog.mint;
+  const symbolFallback = truncateMint(mint);
+  const symbol = pickTokenLabel([cached.symbol, fromCatalog.symbol], mint, symbolFallback);
+  const name = pickTokenLabel(
+    [cached.name, fromCatalog.name, symbol],
+    mint,
+    symbol,
+  );
+  return {
+    ...fromCatalog,
+    ...cached,
+    symbol,
+    name,
+    logoUrl: cached.logoUrl?.trim() || fromCatalog.logoUrl,
+    tags: cached.tags ?? fromCatalog.tags,
+    organicScore: cached.organicScore ?? fromCatalog.organicScore,
+    isVerified: cached.isVerified ?? fromCatalog.isVerified,
+    source: cached.source ?? fromCatalog.source,
+    // Never merge persisted prices — session/API only.
+    price: undefined,
+    price1d: undefined,
+    price7d: undefined,
+    priceUpdateTime: undefined,
+    priceFetchedAt: undefined,
+  };
+}
+
+function withoutPersistedPrices(meta: TokenMeta): TokenMeta {
+  return {
+    ...meta,
+    price: undefined,
+    price1d: undefined,
+    price7d: undefined,
+    priceUpdateTime: undefined,
+    priceFetchedAt: undefined,
+  };
+}
+
+const sessionTokenPriceStats = new Map<string, TokenPriceStats>();
+
+export function getSessionTokenPriceStats(mint: string): TokenPriceStats | undefined {
+  return sessionTokenPriceStats.get(mint.trim());
+}
+
+function getSessionTokenPriceStatsWithSolAlias(mint: string): TokenPriceStats | undefined {
+  const m = mint.trim();
+  let stats = getSessionTokenPriceStats(m);
+  if (!stats && isSolMint(m)) {
+    stats = getSessionTokenPriceStats(m === NATIVE_SOL_MINT ? WSOL_MINT : NATIVE_SOL_MINT);
+  }
+  return stats;
+}
+
+/** True when every mint has price+decimals resolved within maxAgeMs (default 2s). */
+export function sessionQuotePricesFreshForMints(
+  mints: string[],
+  maxAgeMs = RESOLVE_PRICES_TTL_MS,
+): boolean {
+  const required = mints.map((m) => m.trim()).filter(Boolean);
+  if (required.length === 0) return false;
+  const now = Date.now();
+  return required.every((m) => {
+    const stats = getSessionTokenPriceStatsWithSolAlias(m);
+    if (!stats?.price || stats.price <= 0) return false;
+    if (typeof stats.decimals !== 'number' || !Number.isFinite(stats.decimals)) return false;
+    const fetchedAt = stats.priceFetchedAt ?? 0;
+    return fetchedAt > 0 && now - fetchedAt < maxAgeMs;
+  });
+}
+
+function setSessionTokenPriceStats(mint: string, stats: TokenPriceStats): void {
+  sessionTokenPriceStats.set(mint.trim(), stats);
+}
+
+export function getCachedTokenMeta(mint: string): TokenMeta | null {
+  const m = mint.trim();
+  if (!m) return null;
+  const fromCatalog = catalogTokens.find((t) => t.mint === m);
+  const cached = readCache()[m];
+  if (fromCatalog && cached) return withoutPersistedPrices(mergeCatalogWithDeviceCache(fromCatalog, cached));
+  if (fromCatalog) return fromCatalog;
+  if (cached) return withoutPersistedPrices(cached);
+  if (m === NATIVE_SOL_MINT) {
+    const wsolCatalog = catalogTokens.find((t) => t.mint === WSOL_MINT);
+    const wsolCached = readCache()[WSOL_MINT];
+    const logoUrl = wsolCatalog?.logoUrl ?? wsolCached?.logoUrl ?? '';
+    return {
+      mint: NATIVE_SOL_MINT,
+      symbol: 'SOL',
+      name: 'Solana',
+      logoUrl: resolveLogoUrl(logoUrl),
+      decimals: 9,
+      price: wsolCached?.price ?? wsolCatalog?.price,
+      price1d: wsolCached?.price1d ?? wsolCatalog?.price1d,
+      price7d: wsolCached?.price7d ?? wsolCatalog?.price7d,
+      priceUpdateTime: wsolCached?.priceUpdateTime ?? wsolCatalog?.priceUpdateTime,
+      priceFetchedAt: wsolCached?.priceFetchedAt ?? wsolCatalog?.priceFetchedAt,
+      isVerified: true,
+      source: wsolCached?.source ?? wsolCatalog?.source ?? 'search',
+    };
+  }
+  return null;
+}
+
+export function getTokenDecimalsFromCache(mint: string): number | undefined {
+  return getCachedTokenMeta(mint)?.decimals;
+}
+
+function positiveUsdPrice(value: unknown): number | undefined {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function priceFromCachedMeta(mint: string): number | undefined {
+  const session = getSessionTokenPriceStats(mint.trim())?.price;
+  return positiveUsdPrice(session);
+}
+
+/** SOL/WSOL USD spot from the current session (resolve-prices / Vybe). */
+export function getCachedSolPriceUsd(): number | undefined {
+  return priceFromCachedMeta(NATIVE_SOL_MINT) ?? priceFromCachedMeta(WSOL_MINT);
+}
+
+/** Effective USD holdings value (converts Jupiter SOL quotes using cached SOL price). */
+export function walletItemValueUsd(item: WalletBalanceListItem): number {
+  if (Number.isFinite(item.valueUsd) && item.valueUsd > 0) return item.valueUsd;
+  const valueSol = item.valueSol;
+  if (valueSol != null && valueSol > 0) {
+    const solPrice = getCachedSolPriceUsd();
+    if (solPrice != null && solPrice > 0) return valueSol * solPrice;
+  }
+  return Number.isFinite(item.valueUsd) ? item.valueUsd : 0;
+}
+
+function decimalsFromCachedMeta(mint: string): number | undefined {
+  const m = mint.trim();
+  const sessionDec = getSessionTokenPriceStats(m)?.decimals;
+  if (sessionDec != null && Number.isFinite(sessionDec) && sessionDec >= 0 && sessionDec <= 255) {
+    return Math.trunc(sessionDec);
+  }
+  const dec = getCachedTokenMeta(m)?.decimals;
+  return dec != null && Number.isFinite(dec) && dec >= 0 && dec <= 255 ? Math.trunc(dec) : undefined;
+}
+
+/** Session USD spot for swap gating (resolve-prices / Vybe). */
+export function hasCachedMintPriceUsd(mint: string): boolean {
+  return priceFromCachedMeta(mint) != null;
+}
+
+/** Mint decimals from catalog/cache/session meta. */
+export function hasCachedMintDecimals(mint: string): boolean {
+  return decimalsFromCachedMeta(mint) != null;
+}
+
+export function isSwapMintQuoteReady(mint: string): boolean {
+  const m = mint.trim();
+  if (!m) return false;
+  return hasCachedMintDecimals(m);
+}
+
+export function getSwapMintQuoteReadinessIssues(mint: string, label: string): string[] {
+  const m = mint.trim();
+  if (!m) return [`${label}: mint missing`];
+  const issues: string[] = [];
+  if (!hasCachedMintDecimals(m)) issues.push(`${label} decimals`);
+  return issues;
+}
+
+/** Explicit client swap params for Vybe / ix-builder (prices + decimals from cache). */
+export function buildSwapClientParams(inputMint: string, outputMint: string): {
+  inputMintPrice?: number;
+  outputMintPrice?: number;
+  solPrice?: number;
+  inputMintDecimals?: number;
+  outputMintDecimals?: number;
+} {
+  const input = inputMint.trim();
+  const output = outputMint.trim();
+  const payload: {
+    inputMintPrice?: number;
+    outputMintPrice?: number;
+    solPrice?: number;
+    inputMintDecimals?: number;
+    outputMintDecimals?: number;
+  } = {};
+  const inputPrice = priceFromCachedMeta(input);
+  const outputPrice = priceFromCachedMeta(output);
+  const inputDecimals = decimalsFromCachedMeta(input);
+  const outputDecimals = decimalsFromCachedMeta(output);
+  if (inputPrice != null) payload.inputMintPrice = inputPrice;
+  if (outputPrice != null) payload.outputMintPrice = outputPrice;
+  if (inputDecimals != null) payload.inputMintDecimals = inputDecimals;
+  if (outputDecimals != null) payload.outputMintDecimals = outputDecimals;
+  const needsSol = input && output && !isSolMint(input) && !isSolMint(output);
+  if (needsSol) {
+    const solPrice =
+      priceFromCachedMeta(NATIVE_SOL_MINT) ?? priceFromCachedMeta(WSOL_MINT);
+    if (solPrice != null) payload.solPrice = solPrice;
+  }
+  return payload;
+}
+
+export function saveTokenPriceStats(mint: string, stats: TokenPriceStats): void {
+  const m = mint.trim();
+  if (!m) return;
+  setSessionTokenPriceStats(m, stats);
+  if (isSolMint(m)) {
+    const alt = m === NATIVE_SOL_MINT ? WSOL_MINT : NATIVE_SOL_MINT;
+    setSessionTokenPriceStats(alt, stats);
+  }
+  const existing = getCachedTokenMeta(m);
+  const logoUrl = stats.logoUrl?.trim() || existing?.logoUrl || '';
+  if (logoUrl) clearTokenIconUrlFailure(logoUrl);
+  const symbolFallback = truncateMint(m);
+  const symbol = pickTokenLabel([stats.symbol, existing?.symbol], m, symbolFallback);
+  const name = pickTokenLabel([stats.name, existing?.name, symbol], m, symbol);
+  const meta: TokenMeta = {
+    mint: m,
+    symbol,
+    name,
+    logoUrl: resolveLogoUrl(logoUrl),
+    decimals: stats.decimals ?? existing?.decimals,
+    price: stats.price,
+    price1d: stats.price1d,
+    price7d: stats.price7d,
+    priceFetchedAt: stats.priceFetchedAt,
+    priceUpdateTime: stats.priceUpdateTime,
+    tags: existing?.tags,
+    organicScore: stats.organicScore ?? existing?.organicScore,
+    isVerified: stats.isVerified ?? existing?.isVerified,
+    source: existing?.source ?? 'search',
+    savedAt: Date.now(),
+  };
+  saveTokenMeta(meta);
+  if (isSolMint(m)) refreshWalletBalancesPanel();
+}
+
+/** Map resolve-prices / GET /api/token body into session stats + disk cache. */
+export function applyResolvedTokenFromApi(mint: string, body: Record<string, unknown>): void {
+  const price = typeof body.price === 'number' ? body.price : undefined;
+  const decimals = typeof body.decimals === 'number' ? body.decimals : undefined;
+  if (
+    !(typeof price === 'number' && Number.isFinite(price) && price > 0) ||
+    !(typeof decimals === 'number' && Number.isFinite(decimals))
+  ) {
+    return;
+  }
+  const sourceRaw = String(body.source ?? body.priceSource ?? '').trim();
+  const source =
+    sourceRaw === 'Vybe' || sourceRaw === 'Jupiter' || sourceRaw === 'Pumpfun-API'
+      ? sourceRaw
+      : undefined;
+  saveTokenPriceStats(mint, {
+    mint: mint.trim(),
+    price,
+    decimals,
+    price1d: typeof body.price1d === 'number' ? body.price1d : undefined,
+    price7d: typeof body.price7d === 'number' ? body.price7d : undefined,
+    priceFetchedAt: typeof body.priceFetchedAt === 'number' ? body.priceFetchedAt : Date.now(),
+    priceUpdateTime: typeof body.priceUpdateTime === 'number' ? body.priceUpdateTime : undefined,
+    source,
+    responseTimeMs:
+      typeof body.responseTimeMs === 'number' && Number.isFinite(body.responseTimeMs)
+        ? body.responseTimeMs
+        : undefined,
+    logoUrl: String(body.logoUrl ?? '').trim() || undefined,
+    symbol: String(body.symbol ?? '').trim() || undefined,
+    name: String(body.name ?? '').trim() || undefined,
+    isVerified: body.isVerified === true || body.verified === true,
+    organicScore: typeof body.organicScore === 'number' ? body.organicScore : undefined,
+    tokenProgram: String(body.tokenProgram ?? '').trim() || undefined,
+    marketCapUsd: typeof body.marketCapUsd === 'number' ? body.marketCapUsd : undefined,
+    liquidityUsd: typeof body.liquidityUsd === 'number' ? body.liquidityUsd : undefined,
+    poolAddress: String(body.poolAddress ?? '').trim() || undefined,
+    bondingCurveAddress: String(body.bondingCurveAddress ?? '').trim() || undefined,
+    programAddress: String(body.programAddress ?? '').trim() || undefined,
+    quoteMintAddress: String(body.quoteMintAddress ?? '').trim() || undefined,
+    complete: typeof body.complete === 'boolean' ? body.complete : undefined,
+    description: String(body.description ?? '').trim() || undefined,
+    twitter: String(body.twitter ?? '').trim() || undefined,
+    website: String(body.website ?? '').trim() || undefined,
+    isBanned: typeof body.isBanned === 'boolean' ? body.isBanned : undefined,
+    pumpfunStatus: String(body.pumpfunStatus ?? '').trim() || undefined,
+    creatorAddress: String(body.creatorAddress ?? '').trim() || undefined,
+  });
+}
+
+/** Prefer locally served icon paths; leave remote URLs for server localization. */
+export function resolveLogoUrl(logoUrl: string | undefined): string {
+  const u = (logoUrl ?? '').trim();
+  if (!u) return '';
+  if (u.startsWith('/')) return u;
+  return u;
+}
+
+/** Replace with your own asset at this path (SVG or PNG — update extension here if needed). */
+export const TOKEN_ICON_PLACEHOLDER_PATH = '/images/token-icon-placeholder.svg';
+
+const failedTokenIconUrls = new Set<string>();
+let tokenIconErrorHandlingWired = false;
+
+/** Session-only in-memory icon blobs — avoids refetch when picker DOM is rebuilt. */
+const sessionTokenIconBlobUrls = new Map<string, string>();
+const sessionTokenIconWarmPromises = new Map<string, Promise<string>>();
+
+const TOKEN_ICON_IMG_SELECTOR =
+  '.token-picker-row-logo-img, .token-picker-shortcut img, .swap-token-chip-icon img, .routing-token-img, .swap-pair-icon-img';
+
+function tokenIconSessionKey(src: string): string {
+  const s = src.trim();
+  if (!s || s.startsWith('blob:')) return s;
+  try {
+    return new URL(s, window.location.origin).href;
+  } catch {
+    return s;
+  }
+}
+
+function displayTokenIconSrc(canonicalSrc: string): string {
+  if (canonicalSrc === TOKEN_ICON_PLACEHOLDER_PATH) return canonicalSrc;
+  return sessionTokenIconBlobUrls.get(tokenIconSessionKey(canonicalSrc)) ?? canonicalSrc;
+}
+
+function warmSessionTokenIconViaImage(src: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth || 64;
+        const h = img.naturalHeight || 64;
+        if (!w || !h) {
+          resolve(null);
+          return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(null);
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob((blob) => {
+          if (!blob) {
+            resolve(null);
+            return;
+          }
+          const blobUrl = URL.createObjectURL(blob);
+          sessionTokenIconBlobUrls.set(tokenIconSessionKey(src), blobUrl);
+          resolve(blobUrl);
+        }, 'image/png');
+      } catch {
+        resolve(null);
+      }
+    };
+    img.onerror = () => {
+      markTokenIconUrlFailed(src);
+      resolve(null);
+    };
+    img.src = src;
+  });
+}
+
+async function warmSessionTokenIcon(originSrc: string): Promise<string> {
+  const key = tokenIconSessionKey(originSrc);
+  if (!key || key === TOKEN_ICON_PLACEHOLDER_PATH) return TOKEN_ICON_PLACEHOLDER_PATH;
+  if (isTokenIconUrlFailed(key)) return TOKEN_ICON_PLACEHOLDER_PATH;
+  const cached = sessionTokenIconBlobUrls.get(key);
+  if (cached) return cached;
+
+  const inflight = sessionTokenIconWarmPromises.get(key);
+  if (inflight) return inflight;
+
+  const work = (async (): Promise<string> => {
+    try {
+      const res = await fetch(key);
+      if (res.ok) {
+        const blob = await res.blob();
+        if (blob.size > 0) {
+          const blobUrl = URL.createObjectURL(blob);
+          sessionTokenIconBlobUrls.set(key, blobUrl);
+          return blobUrl;
+        }
+      }
+    } catch {
+      markTokenIconUrlFailed(key);
+      return TOKEN_ICON_PLACEHOLDER_PATH;
+    }
+
+    const viaImage = await warmSessionTokenIconViaImage(key);
+    return viaImage ?? originSrc;
+  })();
+
+  sessionTokenIconWarmPromises.set(key, work);
+  try {
+    return await work;
+  } finally {
+    sessionTokenIconWarmPromises.delete(key);
+  }
+}
+
+function hydrateTokenIconImgs(root: ParentNode | null | undefined): void {
+  if (!root) return;
+  root.querySelectorAll<HTMLImageElement>('img[data-token-icon-origin]').forEach((img) => {
+    bindTokenIconImg(img);
+  });
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    for (const blobUrl of sessionTokenIconBlobUrls.values()) {
+      URL.revokeObjectURL(blobUrl);
+    }
+    sessionTokenIconBlobUrls.clear();
+  });
+}
+
+export function markTokenIconUrlFailed(url: string): void {
+  const u = tokenIconSessionKey(url);
+  if (u && u !== TOKEN_ICON_PLACEHOLDER_PATH && !u.endsWith(TOKEN_ICON_PLACEHOLDER_PATH)) {
+    failedTokenIconUrls.add(u);
+  }
+}
+
+export function clearTokenIconUrlFailure(url: string | undefined): void {
+  const u = tokenIconSessionKey(url ?? '');
+  if (u) failedTokenIconUrls.delete(u);
+}
+
+function isTokenIconUrlFailed(url: string): boolean {
+  return failedTokenIconUrls.has(tokenIconSessionKey(url));
+}
+
+/** Best logo URL for a mint: device cache, then in-session resolve-prices stats. */
+export function resolveTokenLogoUrl(mint: string | undefined): string | undefined {
+  const m = mint?.trim() ?? '';
+  if (!m) return undefined;
+  const fromMeta = getCachedTokenMeta(m)?.logoUrl?.trim();
+  if (fromMeta) return fromMeta;
+  const fromSession = getSessionTokenPriceStats(m)?.logoUrl?.trim();
+  return fromSession || undefined;
+}
+
+/** Icon src for display; uses placeholder when URL is missing or already failed this session. */
+export function effectiveTokenIconSrc(logoUrl: string | undefined): string {
+  const src = resolveLogoUrl(logoUrl);
+  if (!src || isTokenIconUrlFailed(src)) return TOKEN_ICON_PLACEHOLDER_PATH;
+  return src;
+}
+
+export function renderTokenIconImgHtml(src: string, className: string, alt = 'Token logo'): string {
+  const displaySrc = displayTokenIconSrc(src);
+  const placeholderClass = displaySrc === TOKEN_ICON_PLACEHOLDER_PATH ? ' token-icon-img--placeholder' : '';
+  const originAttr =
+    src !== TOKEN_ICON_PLACEHOLDER_PATH && !src.startsWith('blob:')
+      ? ` data-token-icon-origin="${escapeHtml(tokenIconSessionKey(src))}"`
+      : '';
+  return `<img class="${className}${placeholderClass}" src="${escapeHtml(displaySrc)}"${originAttr} alt="${escapeHtml(alt)}" loading="lazy" decoding="async" />`;
+}
+
+export function handleTokenIconImgError(img: HTMLImageElement): void {
+  const origin = img.dataset.tokenIconOrigin?.trim() || img.currentSrc || img.src;
+  markTokenIconUrlFailed(origin);
+  img.onerror = null;
+  img.src = TOKEN_ICON_PLACEHOLDER_PATH;
+  img.classList.add('token-icon-img--placeholder');
+  img.removeAttribute('data-token-icon-origin');
+}
+
+export function bindTokenIconImg(img: HTMLImageElement): void {
+  if (img.dataset.tokenIconBound === '1') return;
+  img.dataset.tokenIconBound = '1';
+  img.addEventListener('error', () => handleTokenIconImgError(img), { once: true });
+
+  const origin = img.dataset.tokenIconOrigin?.trim();
+  if (!origin || origin === TOKEN_ICON_PLACEHOLDER_PATH) return;
+  const key = tokenIconSessionKey(origin);
+  if (isTokenIconUrlFailed(origin)) {
+    img.src = TOKEN_ICON_PLACEHOLDER_PATH;
+    img.classList.add('token-icon-img--placeholder');
+    return;
+  }
+
+  const applyCached = (): void => {
+    const blob = sessionTokenIconBlobUrls.get(key);
+    if (blob && img.src !== blob) img.src = blob;
+  };
+
+  applyCached();
+  if (sessionTokenIconBlobUrls.has(key)) return;
+
+  const cacheFromLoaded = (): void => {
+    if (sessionTokenIconBlobUrls.has(key)) {
+      applyCached();
+      return;
+    }
+    if (!img.complete || img.naturalWidth <= 0) return;
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      canvas.toBlob((blob) => {
+        if (!blob || sessionTokenIconBlobUrls.has(key)) return;
+        const blobUrl = URL.createObjectURL(blob);
+        sessionTokenIconBlobUrls.set(key, blobUrl);
+        if (img.isConnected) img.src = blobUrl;
+      }, 'image/png');
+    } catch {
+      if (isTokenIconUrlFailed(origin)) return;
+      void warmSessionTokenIcon(origin).then((resolved) => {
+        if (resolved.startsWith('blob:') && img.isConnected) img.src = resolved;
+      });
+    }
+  };
+
+  if (img.complete) cacheFromLoaded();
+  else img.addEventListener('load', cacheFromLoaded, { once: true });
+}
+
+/** Capture-phase listener: img error events do not bubble. */
+export function ensureTokenIconErrorHandling(): void {
+  if (tokenIconErrorHandlingWired) return;
+  tokenIconErrorHandlingWired = true;
+  document.addEventListener(
+    'error',
+    (e) => {
+      const t = e.target;
+      if (!(t instanceof HTMLImageElement)) return;
+      if (!t.matches(TOKEN_ICON_IMG_SELECTOR)) return;
+      handleTokenIconImgError(t);
+    },
+    true,
+  );
+}
+
+function needsRemoteLogoResolve(meta: TokenMeta | null | undefined): boolean {
+  if (!meta) return true;
+  const mint = meta.mint.trim();
+  const sym = meta.symbol?.trim();
+  const name = meta.name?.trim();
+  if (!sym || isMintLikeLabel(sym, mint)) return true;
+  if (!name || isMintLikeLabel(name, mint)) return true;
+  if (meta.decimals == null) return true;
+  const u = (meta.logoUrl ?? '').trim();
+  if (!u || u === TOKEN_ICON_PLACEHOLDER_PATH) return true;
+  if (isTokenIconUrlFailed(u)) return true;
+  // Local icon alone is not enough — labels must be resolved first (see checks above).
+  if (meta.source === 'search' && u.startsWith('/')) return false;
+  if (u.startsWith('/')) return false;
+  // Catalog / wallet rows may keep remote icon URLs; browser loads them directly.
+  return false;
+}
+
+function mergeTokenMeta(existing: TokenMeta | undefined, incoming: TokenMeta): TokenMeta {
+  if (!existing) return incoming;
+  const mint = incoming.mint;
+  const symbolFallback = truncateMint(mint);
+  const symbol = pickTokenLabel([incoming.symbol, existing.symbol], mint, symbolFallback);
+  const name = pickTokenLabel([incoming.name, existing.name, symbol], mint, symbol);
+  const logoUrl = resolveLogoUrl(incoming.logoUrl?.trim() || existing.logoUrl?.trim() || '');
+  return {
+    ...existing,
+    ...incoming,
+    symbol,
+    name,
+    logoUrl,
+    decimals: incoming.decimals ?? existing.decimals,
+    price: incoming.price ?? existing.price,
+    price1d: incoming.price1d ?? existing.price1d,
+    price7d: incoming.price7d ?? existing.price7d,
+    priceUpdateTime: incoming.priceUpdateTime ?? existing.priceUpdateTime,
+    priceFetchedAt: incoming.priceFetchedAt ?? existing.priceFetchedAt,
+    tags: incoming.tags ?? existing.tags,
+    organicScore: incoming.organicScore ?? existing.organicScore,
+    isVerified: incoming.isVerified ?? existing.isVerified,
+    source: incoming.source ?? existing.source,
+    savedAt: Math.max(existing.savedAt ?? 0, incoming.savedAt ?? 0),
+  };
+}
+
+function saveTokenMeta(meta: TokenMeta): void {
+  const cache = readCache();
+  cache[meta.mint] = mergeTokenMeta(cache[meta.mint], meta);
+  writeCache(cache);
+  const recent = readRecent().filter((m) => m !== meta.mint);
+  recent.unshift(meta.mint);
+  writeRecent(recent);
+}
+
+function parseCatalogTsv(text: string): TokenMeta[] {
+  const now = Date.now();
+  const out: TokenMeta[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    if (trimmed.toLowerCase().startsWith('mint\t')) continue;
+    const parts = trimmed.split('\t');
+    if (parts.length < 4) continue;
+    const [mint, symbol, name, logoUrl, decimalsRaw, tagsRaw] = parts;
+    const rawMint = (mint ?? '').trim();
+    if (!rawMint) continue;
+    const m = preferNativeSolMint(rawMint);
+    const isNativeSol = m === NATIVE_SOL_MINT;
+    const dec = decimalsRaw?.trim() ? Number(decimalsRaw) : undefined;
+    const tags =
+      tagsRaw?.trim()
+        ? tagsRaw
+            .split(',')
+            .map((t) => t.trim())
+            .filter(Boolean)
+        : undefined;
+    out.push({
+      mint: m,
+      symbol: isNativeSol ? 'SOL' : (symbol ?? '').trim() || truncateMint(m),
+      name: isNativeSol ? 'Solana' : (name ?? '').trim() || (symbol ?? '').trim() || m,
+      logoUrl: resolveLogoUrl(logoUrl ?? ''),
+      decimals: isNativeSol ? 9 : Number.isFinite(dec) ? dec : undefined,
+      tags,
+      source: 'catalog',
+      savedAt: now,
+    });
+  }
+  return out;
+}
+
+function catalogEntryFromJson(raw: Record<string, unknown>): TokenMeta | null {
+  const rawMint = String(raw.mint ?? raw.id ?? '').trim();
+  if (!rawMint) return null;
+  // Jupiter TOP lists SOL as WSOL mint; picker blocks WSOL — map to native SOL for TOP.
+  const mint = preferNativeSolMint(rawMint);
+  const isNativeSol = mint === NATIVE_SOL_MINT;
+  const tags = Array.isArray(raw.tags)
+    ? raw.tags.map((t) => String(t))
+    : typeof raw.tags === 'string' && raw.tags
+      ? [raw.tags]
+      : undefined;
+  const organicScore = typeof raw.organicScore === 'number' ? raw.organicScore : undefined;
+  return {
+    mint,
+    symbol: isNativeSol ? 'SOL' : String(raw.symbol ?? '').trim() || truncateMint(mint),
+    name: isNativeSol
+      ? 'Solana'
+      : String(raw.name ?? '').trim() || String(raw.symbol ?? mint),
+    logoUrl: resolveLogoUrl(String(raw.logoUrl ?? raw.icon ?? '')),
+    decimals: isNativeSol
+      ? 9
+      : typeof raw.decimals === 'number'
+        ? raw.decimals
+        : undefined,
+    tags,
+    organicScore,
+    isVerified: raw.isVerified === true,
+    source: 'catalog',
+    savedAt: Date.now(),
+  };
+}
+
+async function loadCatalog(): Promise<void> {
+  if (catalogLoaded) return;
+  try {
+    const jsonRes = await fetch(CATALOG_JSON_URL);
+    if (jsonRes.ok) {
+      const body = (await jsonRes.json()) as { tokens?: unknown[] };
+      if (Array.isArray(body.tokens)) {
+        const seen = new Set<string>();
+        catalogTokens = [];
+        for (const t of body.tokens) {
+          const entry = catalogEntryFromJson(t as Record<string, unknown>);
+          if (!entry || seen.has(entry.mint)) continue;
+          seen.add(entry.mint);
+          catalogTokens.push(entry);
+        }
+        catalogLoaded = true;
+        return;
+      }
+    }
+  } catch {
+    /* fall through to TSV */
+  }
+  try {
+    const res = await fetch(CATALOG_TSV_URL);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const seen = new Set<string>();
+    catalogTokens = [];
+    for (const entry of parseCatalogTsv(await res.text())) {
+      if (seen.has(entry.mint)) continue;
+      seen.add(entry.mint);
+      catalogTokens.push(entry);
+    }
+  } catch {
+    catalogTokens = [];
+  }
+  catalogLoaded = true;
+}
+
+function truncateMint(mint: string): string {
+  if (mint.length <= 13) return mint;
+  return `${mint.slice(0, 4)}…${mint.slice(-4)}`;
+}
+
+function isMintLikeLabel(label: string, mint: string): boolean {
+  const s = label.trim();
+  const m = mint.trim();
+  if (!s) return true;
+  if (!m) return false;
+  if (s === m || s === truncateMint(m)) return true;
+  if (BASE58_RE.test(s) && s.length >= 32) return true;
+  // Wallet/API placeholder — short mint prefix (e.g. 4eR37y).
+  if (/^[1-9A-HJ-NP-Za-km-z]+$/.test(s) && s.length >= 4 && s.length <= 12 && m.startsWith(s)) {
+    return true;
+  }
+  return false;
+}
+
+/** Prefer the first real ticker/name; never keep a mint prefix over a resolved label. */
+function pickTokenLabel(
+  candidates: Array<string | undefined | null>,
+  mint: string,
+  fallback: string,
+): string {
+  for (const raw of candidates) {
+    const s = raw?.trim() ?? '';
+    if (s && !isMintLikeLabel(s, mint)) return s;
+  }
+  for (const raw of candidates) {
+    const s = raw?.trim() ?? '';
+    if (s) return s;
+  }
+  return fallback;
+}
+
+function sanitizeTokenLabel(raw: string | undefined, mint: string, fallback?: string): string {
+  const fb = fallback ?? truncateMint(mint);
+  const s = raw?.trim() ?? '';
+  if (!s || isMintLikeLabel(s, mint)) return fb;
+  return s;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function tokenMatchesQuery(token: TokenMeta, query: string, exact: boolean): boolean {
+  const q = query.toLowerCase();
+  const sym = token.symbol.toLowerCase();
+  const name = token.name.toLowerCase();
+  const mint = token.mint.toLowerCase();
+  if (exact) return sym === q || name === q || mint === q;
+  return sym.includes(q) || name.includes(q) || mint.includes(q);
+}
+
+function isPickerSearchActive(): boolean {
+  return searchQuery.trim().length > 0;
+}
+
+function isWalletTabSearchCombo(): boolean {
+  return activeTab === 'wallet' && isPickerSearchActive() && activeSide !== 'input';
+}
+
+function isSellPickerWalletSearch(): boolean {
+  return activeSide === 'input' && isPickerSearchActive();
+}
+
+function getSwapInputMintForPicker(): string {
+  return preferNativeSolMint(getSwapInputMintCb?.().trim() ?? '');
+}
+
+/** When false, selling an alt can buy any token (alt→alt). Matches ix-builder default. */
+const RESTRICT_BUY_OUTPUT_TO_SOL_OR_STABLE = false;
+
+function isBuyOutputPickerRestricted(): boolean {
+  if (!RESTRICT_BUY_OUTPUT_TO_SOL_OR_STABLE) return false;
+  if (activeSide !== 'output') return false;
+  const inputMint = getSwapInputMintForPicker();
+  if (!inputMint) return false;
+  const inputSym = getSwapInputSymbolCb?.()?.trim();
+  return !isSolOrStableMint(inputMint, inputSym);
+}
+
+function isAllowedBuyOutputMint(mint: string, symbolHint?: string): boolean {
+  if (!isBuyOutputPickerRestricted()) return true;
+  return isSolOrStableMint(mint, symbolHint);
+}
+
+function filterTokensForBuyOutputPicker(tokens: TokenMeta[]): TokenMeta[] {
+  if (!isBuyOutputPickerRestricted()) return tokens;
+  return tokens.filter((t) => isSolOrStableMint(t.mint, t.symbol));
+}
+
+function resolveTokenMetaForPicker(meta: TokenMeta): TokenMeta {
+  const mint = meta.mint;
+  const session = getSessionTokenPriceStats(mint);
+  const symbolFallback = truncateMint(mint);
+  const symbol = pickTokenLabel([session?.symbol, meta.symbol], mint, symbolFallback);
+  const name = pickTokenLabel([session?.name, meta.name, symbol], mint, symbol);
+  const logoUrl = resolveLogoUrl(
+    resolveTokenLogoUrl(mint) ?? session?.logoUrl ?? meta.logoUrl ?? '',
+  );
+  if (symbol === meta.symbol && name === meta.name && logoUrl === meta.logoUrl) return meta;
+  return { ...meta, symbol, name, logoUrl };
+}
+
+async function enrichRecentTokenLabels(): Promise<void> {
+  if (activeTab !== 'recent') return;
+  const cache = readCache();
+  const targets = readRecent()
+    .filter((mint) => {
+      const meta = cache[mint] ?? catalogTokens.find((t) => t.mint === mint);
+      if (!meta) return true;
+      return (
+        isMintLikeLabel(meta.symbol ?? '', mint) || isMintLikeLabel(meta.name ?? '', mint)
+      );
+    })
+    .slice(0, 12);
+  if (targets.length === 0) return;
+  await Promise.all(targets.map((mint) => ensureTokenMetaForMint(mint)));
+  if (dialogEl?.open && activeTab === 'recent') {
+    renderList();
+    renderShortcuts();
+  }
+}
+
+function scheduleRecentMetaRefresh(): void {
+  if (activeTab !== 'recent') return;
+  void enrichRecentTokenLabels();
+}
+
+function getVisibleTokens(): TokenMeta[] {
+  if (activeSide === 'input' && isPickerSearchActive()) {
+    return [];
+  }
+  const cache = readCache();
+  const recentMints = readRecent();
+  const rawQ = searchQuery.trim();
+  if (!rawQ) {
+    let base: TokenMeta[] =
+      activeTab === 'top'
+        ? catalogTokens
+        : recentMints
+            .map((mint) => {
+              const hit = cache[mint] ?? catalogTokens.find((t) => t.mint === mint);
+              return hit ? resolveTokenMetaForPicker(hit) : null;
+            })
+            .filter((t): t is TokenMeta => Boolean(t));
+
+    if (activeSide === 'input' && activeTab === 'recent') {
+      return sortTokensForSellPicker(base);
+    }
+    return filterTokensForBuyOutputPicker(base);
+  }
+
+  const exact = rawQ.startsWith('"') && rawQ.endsWith('"') && rawQ.length > 2;
+  const q = exact ? rawQ.slice(1, -1).trim() : rawQ;
+
+  if (BASE58_RE.test(q)) {
+    const inWallet =
+      activeTab === 'wallet' &&
+      (sessionWalletBalances?.items.some((i) => i.mintAddress === q) ?? false);
+    const hit = catalogTokens.find((t) => t.mint === q) ?? cache[q];
+    if (hit) {
+      const resolved = resolveTokenMetaForPicker(hit);
+      return inWallet ? [] : filterTokensForBuyOutputPicker([resolved]);
+    }
+    if (pendingMintLookup === q) return [];
+    return [];
+  }
+
+  const filtered = catalogTokens.filter((t) => tokenMatchesQuery(t, q, exact));
+  const cacheHits = Object.values(cache).filter(
+    (t) => t.source === 'search' && tokenMatchesQuery(t, q, exact) && !filtered.some((f) => f.mint === t.mint),
+  );
+  let merged = [...filtered, ...cacheHits];
+
+  if (activeTab === 'wallet' && sessionWalletBalances) {
+    const walletMints = new Set(
+      sessionWalletBalances.items
+        .filter((item) => walletItemMatchesQuery(item, q))
+        .map((item) => item.mintAddress),
+    );
+    merged = merged.filter((t) => !walletMints.has(t.mint));
+  }
+
+  if (activeSide === 'input') {
+    return sortTokensForSellPicker(merged);
+  }
+  return filterTokensForBuyOutputPicker(merged);
+}
+
+async function fetchTokenByMint(
+  mint: string,
+  options?: { skipVybe?: boolean },
+): Promise<TokenMeta | null> {
+  try {
+    const qs = options?.skipVybe ? '?skipVybe=1' : '';
+    const res = await fetch(`/api/token/${encodeURIComponent(mint)}${qs}`);
+    if (!res.ok) return null;
+    const body = (await res.json()) as Record<string, unknown>;
+    if (body.error) return null;
+    applyResolvedTokenFromApi(mint, body);
+    const symbol = sanitizeTokenLabel(String(body.symbol ?? ''), mint, truncateMint(mint));
+    const name = sanitizeTokenLabel(
+      String(body.name ?? ''),
+      mint,
+      symbol !== truncateMint(mint) ? symbol : truncateMint(mint),
+    );
+    const logoUrl = resolveLogoUrl(String(body.logoUrl ?? ''));
+    const decimals = typeof body.decimals === 'number' ? body.decimals : undefined;
+    const price = typeof body.price === 'number' ? body.price : undefined;
+    const price1d = typeof body.price1d === 'number' ? body.price1d : undefined;
+    const price7d = typeof body.price7d === 'number' ? body.price7d : undefined;
+    const priceUpdateTime = typeof body.priceUpdateTime === 'number' ? body.priceUpdateTime : undefined;
+    const priceFetchedAt = typeof body.priceFetchedAt === 'number' ? body.priceFetchedAt : undefined;
+    const tokenProgram = String(body.tokenProgram ?? body.program ?? '').trim();
+    const tags: string[] = [];
+    if (/2022/i.test(tokenProgram) || body.isToken2022 === true) tags.push('Token2022');
+    const meta: TokenMeta = {
+      mint,
+      symbol: symbol || truncateMint(mint),
+      name: name || symbol || truncateMint(mint),
+      logoUrl,
+      decimals,
+      price,
+      price1d,
+      price7d,
+      priceUpdateTime,
+      priceFetchedAt,
+      tags: tags.length ? tags : undefined,
+      isVerified: body.isVerified === true,
+      organicScore: typeof body.organicScore === 'number' ? body.organicScore : undefined,
+      source: 'search',
+      savedAt: Date.now(),
+    };
+    saveTokenMeta(meta);
+    return meta;
+  } catch {
+    return null;
+  }
+}
+
+function renderTokenIcon(token: TokenMeta): string {
+  const logoUrl = resolveTokenLogoUrl(token.mint) ?? token.logoUrl;
+  const alt = `${token.symbol || 'Token'} logo`;
+  return renderTokenIconImgHtml(effectiveTokenIconSrc(logoUrl), 'token-picker-row-logo-img', alt);
+}
+
+function formatBalanceAmount(amount: number): string {
+  if (!Number.isFinite(amount)) return '0';
+  if (amount >= 1000) return amount.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (amount >= 1) return amount.toFixed(4).replace(/\.?0+$/, '');
+  return amount.toFixed(6).replace(/\.?0+$/, '') || '0';
+}
+
+/** ≥ $0.01 → two decimals; sub-cent → &lt; $0.01 (below tradable minimum). */
+function formatWalletBalanceUsd(valueUsd: number): string {
+  if (!Number.isFinite(valueUsd) || valueUsd <= 0) return '< $0.01';
+  const abs = Math.abs(valueUsd);
+
+  if (abs >= SPL_MIN_TRADABLE_VALUE_USD) {
+    return `~$${abs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+
+  return '< $0.01';
+}
+
+function walletItemToTokenMeta(item: WalletBalanceListItem): TokenMeta {
+  const catalogHit = catalogTokens.find((t) => t.mint === item.mintAddress);
+  const cached = readCache()[item.mintAddress];
+  const base = catalogHit ?? cached;
+  const mint = item.mintAddress;
+  const session = getSessionTokenPriceStats(mint);
+  const symbolFallback = truncateMint(mint);
+  const symbol =
+    mint === NATIVE_SOL_MINT
+      ? 'SOL'
+      : mint === WSOL_MINT
+        ? 'WSOL'
+        : pickTokenLabel([session?.symbol, item.symbol, base?.symbol, cached?.symbol], mint, symbolFallback);
+  const name =
+    mint === NATIVE_SOL_MINT
+      ? 'Solana'
+      : mint === WSOL_MINT
+        ? 'Wrapped SOL'
+        : pickTokenLabel([session?.name, item.name, base?.name, cached?.name, symbol], mint, symbol);
+  return {
+    mint: item.mintAddress,
+    symbol,
+    name,
+    logoUrl: resolveLogoUrl(
+      resolveTokenLogoUrl(item.mintAddress) ?? item.logoUrl ?? base?.logoUrl ?? '',
+    ),
+    decimals: item.decimals ?? base?.decimals,
+    isVerified: item.verified || base?.isVerified,
+    tags: base?.tags,
+    organicScore: base?.organicScore,
+    source: base?.source ?? 'search',
+    savedAt: Date.now(),
+  };
+}
+
+function renderWalletBalanceRow(item: WalletBalanceListItem): string {
+  const token = walletItemToTokenMeta(item);
+  const isSellPicker = activeSide === 'input';
+  const blocked = isBlockedPickerMint(item.mintAddress);
+  const tradable = isSellPicker ? isWalletTokenTradable(item.mintAddress) : true;
+  const amountLabel = `${formatBalanceAmount(item.amountUi)} ${token.symbol}`;
+  const fiatLabel = formatWalletBalanceUsd(walletItemValueUsd(item));
+  const statusTag = blocked
+    ? '<span class="token-picker-row-tag token-picker-row-tag--muted">Use SOL</span>'
+    : isSellPicker && !tradable
+      ? '<span class="token-picker-row-tag token-picker-row-tag--muted">Too small</span>'
+      : '';
+  const disabledAttr = blocked || (isSellPicker && !tradable) ? ' disabled aria-disabled="true"' : '';
+  const pendingClass = item.enrichmentPending ? ' token-picker-row--pending' : '';
+  const untradableClass = blocked || (isSellPicker && !tradable) ? ' token-picker-row--untradable' : '';
+  return `<button type="button" class="token-picker-row token-picker-row--wallet${untradableClass}${pendingClass}" data-mint="${escapeHtml(item.mintAddress)}"${disabledAttr}>
+    <span class="token-picker-row-logo">${renderTokenIcon(token)}</span>
+    <span class="token-picker-row-main">
+      <span class="token-picker-row-title">
+        <span class="token-picker-row-symbol">${escapeHtml(token.symbol)}</span>
+        ${statusTag}
+      </span>
+      <span class="token-picker-row-sub">${escapeHtml(token.name)}</span>
+    </span>
+    <span class="token-picker-row-amount-wrap">
+      <span class="token-picker-row-amount">${escapeHtml(amountLabel)}</span>
+      <span class="token-picker-row-fiat">${escapeHtml(fiatLabel)}</span>
+    </span>
+  </button>`;
+}
+
+function syncWalletBalancesVisibility(): void {
+  if (!walletBalancesEl) return;
+  walletBalancesEl.hidden = activeTab !== 'wallet';
+}
+
+function syncSellPickerTabVisibility(): void {
+  const isSell = activeSide === 'input';
+  document
+    .querySelectorAll('.token-picker-tab[data-tab="top"], .token-picker-tab[data-tab="recent"]')
+    .forEach((el) => {
+      (el as HTMLElement).hidden = isSell;
+    });
+}
+
+function syncTopTabDisabledState(): void {
+  const isSell = activeSide === 'input';
+  document.querySelectorAll('.token-picker-tab[data-tab="top"]').forEach((el) => {
+    const btn = el as HTMLButtonElement;
+    btn.disabled = isSell;
+    btn.classList.toggle('token-picker-tab--disabled', isSell);
+    btn.setAttribute('aria-disabled', isSell ? 'true' : 'false');
+  });
+}
+
+function syncPickerLayout(): void {
+  const isSell = activeSide === 'input';
+  const walletSearchCombo = isWalletTabSearchCombo();
+  if (isSell && (activeTab === 'top' || activeTab === 'recent')) {
+    activeTab = 'wallet';
+  }
+  if (dialogEl) {
+    dialogEl.classList.toggle('token-picker-dialog--sell', isSell);
+    dialogEl.classList.toggle('token-picker-dialog--buy', !isSell);
+    dialogEl.classList.toggle('token-picker-dialog--wallet-tab', activeTab === 'wallet');
+    dialogEl.classList.toggle(
+      'token-picker-dialog--list-tab',
+      !isSell && (activeTab === 'top' || activeTab === 'recent'),
+    );
+    dialogEl.classList.toggle('token-picker-dialog--wallet-search', walletSearchCombo);
+    dialogEl.classList.toggle('token-picker-dialog--sell-wallet-search', isSellPickerWalletSearch());
+  }
+  if (searchWrapEl) searchWrapEl.hidden = false;
+  if (tabsEl) tabsEl.hidden = false;
+  syncSellPickerTabVisibility();
+  if (shortcutsEl && !isSell) shortcutsEl.hidden = false;
+  if (listWrapEl) {
+    listWrapEl.hidden =
+      isSell || !(activeTab === 'top' || activeTab === 'recent' || walletSearchCombo);
+  }
+  if (listHeadEl) listHeadEl.hidden = !walletSearchCombo;
+  syncTopTabDisabledState();
+  syncWalletBalancesVisibility();
+  syncTabs();
+  syncRefetchHoldingsBtn();
+}
+
+/** Vybe reports native SOL under System Program id, not WSOL mint. */
+export const NATIVE_SOL_MINT = '11111111111111111111111111111111';
+export const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+/** Leave this much SOL in wallet when selling (rent + fees). */
+export const SOL_WALLET_MIN_RESERVE_UI = 0.006;
+/** Max-sell / 100% button leaves this much SOL; manual amounts may use full balance. */
+/** Total SOL below this is skipped for auto-pick (prefer USDC/USDT instead). */
+export const SOL_MIN_AUTO_PICK_TOTAL_UI = 0.0065;
+/** Total SOL below this is not tradable (max sell would be ≤ 0.0001 SOL). */
+export const SOL_MIN_TRADABLE_TOTAL_UI = 0.0061;
+/** Non-SOL wallet balance below this USD value is not tradable (dust). */
+export const SPL_MIN_TRADABLE_VALUE_USD = 0.01;
+/** Each retry step lowers sell amount by this many percent of wallet balance. */
+export const SPL_SELL_SIM_RETRY_STEP_PCT = 2;
+/** Max sell-amount attempts per router before switching (100%, 98%, 96%). */
+export const SPL_SELL_SIM_MAX_ATTEMPTS_PER_ROUTER = 3;
+/** @deprecated Use SPL_SELL_SIM_MAX_ATTEMPTS_PER_ROUTER. */
+export const SPL_SELL_SIM_MAX_STEPS = SPL_SELL_SIM_MAX_ATTEMPTS_PER_ROUTER;
+export const SPL_SELL_SIM_MIN_BALANCE_FRACTION = 0.5;
+/** @deprecated Use computeSplSellAmountForRetryStep(balance, 1). */
+export const SPL_SELL_SIM_RETRY_FRACTION = 1 - SPL_SELL_SIM_RETRY_STEP_PCT / 100;
+
+const splMaxSellFractionByMint = new Map<string, number>();
+
+export function getSplMaxSellFraction(mint: string): number | null {
+  const key = mint.trim();
+  return splMaxSellFractionByMint.has(key) ? splMaxSellFractionByMint.get(key)! : null;
+}
+
+/** Remember a conservative max sell fraction after sim failure retries only (not routine quote normalization). */
+export function noteSplMaxSellFraction(mint: string, amountUi: number, balanceUi: number): void {
+  const key = mint.trim();
+  if (isSolMint(key)) return;
+  if (!key || !Number.isFinite(amountUi) || !Number.isFinite(balanceUi) || balanceUi <= 0) return;
+  const fraction = amountUi / balanceUi;
+  if (fraction <= 0 || fraction > 1) return;
+  const prev = splMaxSellFractionByMint.get(key);
+  if (prev == null || fraction < prev) {
+    splMaxSellFractionByMint.set(key, fraction);
+  }
+}
+
+export function isNearMaxSellAmountUi(amountUi: number, balanceUi: number): boolean {
+  if (!Number.isFinite(amountUi) || !Number.isFinite(balanceUi) || balanceUi <= 0) return false;
+  if (amountUi >= balanceUi * 0.995) return true;
+  return amountUi >= balanceUi * 0.9;
+}
+
+/** Strict max-sell match for 100% button highlight and Vybe exact-balance sells (not the 90% sim-retry heuristic). */
+export function isAtMaxSellAmountUi(amountUi: number, maxUi: number, mint?: string): boolean {
+  if (!Number.isFinite(amountUi) || !Number.isFinite(maxUi) || maxUi <= 0) return false;
+  if (amountUi > maxUi * 1.000001) return false;
+  if (mint) {
+    const decimals = getTokenDecimalsFromCache(mint) ?? 9;
+    const eps = Math.pow(10, -Math.min(Math.max(decimals, 0), 12)) * 1.5;
+    return Math.abs(amountUi - maxUi) <= eps;
+  }
+  return amountUi >= maxUi * 0.9995;
+}
+
+function quotedBuildOutAmountRaw(buildPayload?: Record<string, unknown> | null): string | null {
+  if (!buildPayload) return null;
+  const details = buildPayload.details as Record<string, unknown> | undefined;
+  const quote = details?.quote as Record<string, unknown> | undefined;
+  const candidates = [quote?.outAmount, buildPayload.outAmount];
+  for (const raw of candidates) {
+    const digits = String(raw ?? '').trim();
+    if (/^\d+$/.test(digits) && digits !== '0') return digits;
+  }
+  return null;
+}
+
+function isQuoteBridgeBuildPayload(buildPayload?: Record<string, unknown> | null): boolean {
+  if (!buildPayload) return false;
+  const details = buildPayload.details as { preSwapNeeded?: boolean; postSwapNeeded?: boolean } | undefined;
+  return (
+    details?.preSwapNeeded === true ||
+    details?.postSwapNeeded === true ||
+    buildPayload.preSwapNeeded === true ||
+    buildPayload.postSwapNeeded === true
+  );
+}
+
+/** Prefer nested `_build` when the vybe-quote API body is passed whole. */
+function resolveSwapSimBuildPayload(
+  buildPayload?: Record<string, unknown> | null,
+): Record<string, unknown> | null | undefined {
+  if (!buildPayload) return buildPayload;
+  const nested = buildPayload._build;
+  if (nested && typeof nested === 'object') return nested as Record<string, unknown>;
+  return buildPayload;
+}
+
+export function swapSimulationFailed(
+  simulatedOutRaw: string | null | undefined,
+  buildTx: unknown,
+  buildPayload?: Record<string, unknown> | null,
+): boolean {
+  const build = resolveSwapSimBuildPayload(buildPayload);
+  const quoteShell = build !== buildPayload ? buildPayload : null;
+
+  /* Quote-bridge: main leg is not simulated without intermediate mint — quoted out is enough. */
+  if (isQuoteBridgeBuildPayload(build) && quotedBuildOutAmountRaw(build)) {
+    return false;
+  }
+
+  const simulationErr =
+    build?._simulationErr ??
+    build?.simulationErr ??
+    (quoteShell && !quoteShell._build ? quoteShell._simulationErr : null) ??
+    (quoteShell && !quoteShell._build ? quoteShell.simulationErr : null);
+  if (simulationErr != null) return true;
+  if (!buildTx || typeof buildTx !== 'string' || buildTx.length === 0) return false;
+  if (simulatedOutRaw != null && simulatedOutRaw !== '') return false;
+  if (quotedBuildOutAmountRaw(build)) return false;
+  const topOut = String(quoteShell?.outAmount ?? buildPayload?.outAmount ?? '').trim();
+  if (/^\d+$/.test(topOut) && topOut !== '0') return false;
+  return true;
+}
+
+/** Do not overwrite the sell input when quote inAmount is only fee/normalization noise at max sell. */
+export function shouldApplySellAmountFromQuoteInAmount(
+  requestedUi: number,
+  quotedInUi: number,
+  mint: string,
+  options?: WalletSellableOptions,
+): boolean {
+  if (!Number.isFinite(requestedUi) || requestedUi <= 0) return false;
+  if (!Number.isFinite(quotedInUi) || quotedInUi <= 0) return false;
+  const relDiff = Math.abs(requestedUi - quotedInUi) / requestedUi;
+  if (relDiff < 0.001) return false;
+
+  const sellable = getWalletSellableAmountUi(mint, options);
+  if (sellable != null && sellable > 0) {
+    const atSellableCeiling =
+      isAtMaxSellAmountUi(requestedUi, sellable, mint) ||
+      (requestedUi <= sellable * 1.001 && quotedInUi <= sellable * 1.001);
+    if (atSellableCeiling && quotedInUi <= sellable * 1.001) return false;
+  }
+
+  return quotedInUi < requestedUi * 0.999;
+}
+
+/** step 1 → 98% of balance, step 2 → 96%, etc. */
+export function computeSplSellAmountForRetryStep(balanceUi: number, step: number): number {
+  if (!Number.isFinite(balanceUi) || balanceUi <= 0 || step <= 0) return 0;
+  const fraction = Math.max(
+    SPL_SELL_SIM_MIN_BALANCE_FRACTION,
+    1 - (SPL_SELL_SIM_RETRY_STEP_PCT / 100) * step,
+  );
+  return balanceUi * fraction;
+}
+
+export function shouldContinueSplSellSimRetry(
+  inputMint: string,
+  amountUi: number,
+  balanceUi: number,
+  step: number,
+): boolean {
+  if (isSolMint(inputMint)) return false;
+  if (step >= SPL_SELL_SIM_MAX_ATTEMPTS_PER_ROUTER - 1) return false;
+  if (!Number.isFinite(balanceUi) || balanceUi <= 0) return false;
+  if (amountUi < balanceUi * SPL_SELL_SIM_MIN_BALANCE_FRACTION) return false;
+  return true;
+}
+
+/** Compute a lower sell amount when max balance simulation fails (input-side fee reserve). */
+export function computeSplSellRetryAmountUi(
+  balanceUi: number,
+  swapFeePct: number | null,
+  learnedFraction?: number | null,
+): number {
+  if (!Number.isFinite(balanceUi) || balanceUi <= 0) return 0;
+  let amount = computeSplSellAmountForRetryStep(balanceUi, 1);
+  if (swapFeePct != null && swapFeePct > 0) {
+    const feeAdjusted = balanceUi / (1 + swapFeePct / 100) * 0.99;
+    amount = Math.min(amount, feeAdjusted);
+  }
+  if (learnedFraction != null && learnedFraction > 0 && learnedFraction < 1) {
+    amount = Math.min(amount, balanceUi * learnedFraction);
+  }
+  return amount;
+}
+
+export function isSolMint(mint: string): boolean {
+  const m = mint.trim();
+  return m === NATIVE_SOL_MINT || m === WSOL_MINT;
+}
+
+export function isNativeSolMint(mint: string): boolean {
+  return mint.trim() === NATIVE_SOL_MINT;
+}
+
+export function isWsolMint(mint: string): boolean {
+  return mint.trim() === WSOL_MINT;
+}
+
+/** Collapse native SOL + WSOL to WSOL for resolve-prices requests. */
+export function dedupeMintsForPriceResolve(mints: string[]): string[] {
+  const out: string[] = [];
+  let solSeen = false;
+  for (const raw of mints) {
+    const m = raw.trim();
+    if (!m) continue;
+    if (isSolMint(m)) {
+      if (solSeen) continue;
+      solSeen = true;
+      out.push(WSOL_MINT);
+      continue;
+    }
+    if (!out.includes(m)) out.push(m);
+  }
+  return out;
+}
+
+/** Pair + wallet mints for resolve-prices: one WSOL fetch, SOL spot when pair is all-SPL. */
+export function mintsForPricePrefetch(primaryMints: string[]): string[] {
+  const deduped = dedupeMintsForPriceResolve(primaryMints);
+  const needsSolSpot =
+    primaryMints.some((m) => isSolMint(m.trim())) ||
+    (deduped.length > 0 && !deduped.includes(WSOL_MINT));
+  if (needsSolSpot && !deduped.includes(WSOL_MINT)) {
+    return [...deduped, WSOL_MINT];
+  }
+  return deduped;
+}
+
+/** WSOL is shown in balances but not selectable — users trade native SOL instead. */
+export function isBlockedPickerMint(mint: string): boolean {
+  return isWsolMint(mint);
+}
+
+export type TokenMintColorKind = 'sol' | 'stable' | 'alt';
+
+const KNOWN_STABLECOIN_MINTS = new Set([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+  'USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB', // USD1
+  '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo', // PYUSD
+  'JEFFSQ3s8T3wKsvp4tnRAsUBW7Cqgnf8ukBZC4C8XBm1', // sUSDC-9
+  'Dn4noZ5jgGfkntzcQSUZ8czkreiZ1ForXYoV2H8Dm7S1', // USDTen
+  '7kbnvuGBxxj8AG9qp8Scn56muWGaRaFqxg1FsRp3PaFT', // UXD
+  'USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX', // USDH
+  'A9mUU4qviSctJVPJdBJWkb28deg915LYJKrzQ19ji3FM', // USDCet
+  'A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6', // USDY
+  'DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT', // USDe
+  '2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH', // USDG
+  'JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD', // JupUSD
+  'yUSDX7W89jXWn4zzDPLnhykDymSjQSmpaJ8e4fjC1fg', // yUSD
+]);
+
+const KNOWN_STABLE_SYMBOLS = new Set([
+  'USDC',
+  'USDT',
+  'USDT1',
+  'PYUSD',
+  'USDH',
+  'UXD',
+  'USDY',
+  'USDS',
+  'USD1',
+  'CASH',
+  'EURC',
+  'DAI',
+  'USDG',
+  'JUPUSD',
+  'YUSD',
+]);
+
+/** Purple = SOL, green = stables, yellow = everything else. */
+export function getTokenMintColorKind(mint: string, symbolHint?: string): TokenMintColorKind {
+  const symHint = (symbolHint ?? '').toUpperCase();
+  if (symHint === 'SOL' || symHint === 'WSOL') return 'sol';
+  if (symHint && KNOWN_STABLE_SYMBOLS.has(symHint)) return 'stable';
+
+  const m = preferNativeSolMint(mint.trim());
+  if (!m) return 'alt';
+  if (isSolMint(m)) return 'sol';
+  if (KNOWN_STABLECOIN_MINTS.has(m)) return 'stable';
+  const meta = getCachedTokenMeta(m);
+  if (meta?.tags?.some((t) => t.toLowerCase() === 'stable')) return 'stable';
+  const sym = (meta?.symbol ?? '').toUpperCase();
+  if (sym && KNOWN_STABLE_SYMBOLS.has(sym)) return 'stable';
+  return 'alt';
+}
+
+export function isSolOrStableMint(mint: string, symbolHint?: string): boolean {
+  const kind = getTokenMintColorKind(mint, symbolHint);
+  return kind === 'sol' || kind === 'stable';
+}
+
+export function tokenBoxColorClass(mint: string, symbolHint?: string): string {
+  return `swap-token-color--${getTokenMintColorKind(mint, symbolHint)}`;
+}
+
+export function tokenSymColorClass(mint: string, symbolHint?: string): string {
+  return `swap-token-sym-color--${getTokenMintColorKind(mint, symbolHint)}`;
+}
+
+export function routingTokenDotClass(mint: string, symbolHint?: string): string {
+  return `routing-token-dot routing-token-dot--${getTokenMintColorKind(mint, symbolHint)}`;
+}
+
+export function preferNativeSolMint(mint: string): string {
+  const m = mint.trim();
+  return m === WSOL_MINT ? NATIVE_SOL_MINT : m;
+}
+
+/** @deprecated Use preferNativeSolMint — UI keeps native SOL; Vybe uses WSOL server-side. */
+export function normalizeSwapSolMint(mint: string): string {
+  return preferNativeSolMint(mint);
+}
+
+export function isSplValueTradable(valueUsd: number): boolean {
+  return Number.isFinite(valueUsd) && valueUsd >= SPL_MIN_TRADABLE_VALUE_USD;
+}
+
+/** Wallet balance row for a mint — native SOL and WSOL are separate entries. */
+export function getWalletBalanceListItem(mint: string): WalletBalanceListItem | null {
+  const m = mint.trim();
+  if (!m || !sessionWalletBalances) return null;
+  if (m === NATIVE_SOL_MINT) {
+    return sessionWalletBalances.items.find((i) => i.mintAddress === NATIVE_SOL_MINT) ?? null;
+  }
+  if (m === WSOL_MINT) {
+    return sessionWalletBalances.items.find((i) => i.mintAddress === WSOL_MINT) ?? null;
+  }
+  return sessionWalletBalances.items.find((i) => i.mintAddress === m) ?? null;
+}
+
+export function getWalletBalanceAmountUi(mint: string): number | null {
+  const item = getWalletBalanceListItem(mint);
+  return item && item.amountUi > 0 ? item.amountUi : null;
+}
+
+/** Format a wallet balance for the sell input without rounding above on-chain amount. */
+export function maxSwapInputStringForWalletItem(item: WalletBalanceListItem): string {
+  const exact = item.amountExact?.trim().replace(/,/g, '');
+  if (exact && /^\d+$/.test(exact)) {
+    const decimals = Number.isFinite(item.decimals) ? item.decimals : 0;
+    const raw = BigInt(exact);
+    const base = 10n ** BigInt(decimals);
+    const whole = raw / base;
+    const frac = raw % base;
+    if (frac === 0n) return whole.toString();
+    const fracStr = frac.toString().padStart(decimals, '0').replace(/0+$/, '');
+    return `${whole}.${fracStr}`;
+  }
+  return formatSwapInputAmountValueFloor(item.amountUi, item.decimals);
+}
+
+export function swapInputUiToRawBigInt(ui: string, decimals: number): bigint {
+  const cleaned = ui.trim().replace(/,/g, '');
+  if (!cleaned) return 0n;
+  const negative = cleaned.startsWith('-');
+  const unsigned = negative ? cleaned.slice(1) : cleaned;
+  const [whole, frac = ''] = unsigned.split('.');
+  const fracPadded = frac.padEnd(decimals, '0').slice(0, decimals);
+  const digits = `${whole || '0'}${fracPadded}`.replace(/^0+(?=\d)/, '');
+  return BigInt(`${negative ? '-' : ''}${digits || '0'}`);
+}
+
+/** Format sell input without rounding above wallet balance — preserves all mint decimals. */
+export function formatSwapInputAmountValueFloor(amount: number, decimals = 9): string {
+  if (!Number.isFinite(amount) || amount <= 0) return '0';
+  const d = Math.max(0, Math.min(decimals, 12));
+  const fixed = amount.toFixed(d);
+  const trimmed = fixed.replace(/\.?0+$/, '');
+  return trimmed || '0';
+}
+
+export function balanceExactRawToUiString(exactRaw: string, decimals: number): string {
+  const raw = exactRaw.trim().replace(/,/g, '');
+  if (!/^\d+$/.test(raw)) return '0';
+  const d = Math.max(0, decimals);
+  const base = 10n ** BigInt(d);
+  const r = BigInt(raw);
+  const whole = r / base;
+  const frac = r % base;
+  if (frac === 0n) return whole.toString();
+  const fracStr = frac.toString().padStart(d, '0').replace(/0+$/, '');
+  return `${whole}.${fracStr}`;
+}
+
+/** True when selling the full on-chain SPL balance (Vybe max / 100% / exact raw match). */
+export function isVybeFullSplSellAmount(
+  amountUi: number,
+  item: WalletBalanceListItem,
+  maxSellSelected = false,
+): boolean {
+  if (isSolMint(item.mintAddress)) return false;
+  const exact = item.amountExact?.trim().replace(/,/g, '');
+  if (!exact || !/^\d+$/.test(exact)) return false;
+  if (maxSellSelected) return true;
+  const decimals = Number.isFinite(item.decimals) ? item.decimals : 0;
+  const amountRaw = swapInputUiToRawBigInt(String(amountUi), decimals);
+  const exactRaw = BigInt(exact);
+  if (exactRaw > 0n && amountRaw >= exactRaw) return true;
+  const maxUi = Number(balanceExactRawToUiString(exact, decimals));
+  if (Number.isFinite(maxUi) && maxUi > 0 && amountUi >= maxUi * 0.999) return true;
+  return false;
+}
+
+export function amountExceedsWalletBalance(amountUi: number, mint: string): boolean {
+  const item = getWalletBalanceListItem(mint);
+  if (!item || !(item.amountUi > 0)) return false;
+  if (!Number.isFinite(amountUi) || amountUi <= 0) return false;
+  const decimals = Number.isFinite(item.decimals) ? item.decimals : 9;
+  const inputStr = formatSwapInputAmountValueFloor(amountUi, decimals);
+  const requiredRaw = swapInputUiToRawBigInt(inputStr, decimals);
+  const availableRaw = item.amountExact?.trim()
+    ? BigInt(item.amountExact.trim().replace(/,/g, ''))
+    : swapInputUiToRawBigInt(maxSwapInputStringForWalletItem(item), decimals);
+  return requiredRaw > availableRaw;
+}
+
+function walletHasMintInSession(mint: string): boolean {
+  if (!sessionWalletBalances) return false;
+  const m = mint.trim();
+  return sessionWalletBalances.items.some((i) => i.mintAddress === m);
+}
+
+/** Ephemeral WSOL path only when wallet has no open WSOL ATA (from latest wallet fetch). */
+function resolveCloseWsolAtaFromSession(): boolean {
+  if (!sessionWalletBalances) return true;
+  return !sessionWalletBalances.items.some((i) => i.mintAddress === WSOL_MINT);
+}
+
+/**
+ * Build Vybe ATA action flags from the latest session wallet balance fetch (no extra API call).
+ */
+export function buildSwapAtaHintsFromSessionBalances(params: {
+  inputMint: string;
+  outputMint: string;
+  amountUi: number;
+  router?: string;
+  maxSellSelected?: boolean;
+}): {
+  closeInputAta: boolean;
+  createOutputAta: boolean | undefined;
+  closeWsolAta?: boolean;
+  amountUi: number;
+  inputBalanceExact?: string;
+  inputDecimals?: number;
+} | null {
+  if (!sessionWalletBalances) return null;
+  const router = params.router?.trim().toLowerCase() ?? '';
+  if (router !== 'vybe') return null;
+
+  const inputMint = params.inputMint.trim();
+  const outputMint = params.outputMint.trim();
+  const closeWsolAta = resolveCloseWsolAtaFromSession();
+
+  let amountUi = params.amountUi;
+  let closeInputAta: boolean;
+  let inputBalanceExact: string | undefined;
+  let inputDecimals: number | undefined;
+
+  if (isSolMint(inputMint)) {
+    closeInputAta = false;
+  } else {
+    const inputRow = sessionWalletBalances.items.find((i) => i.mintAddress === inputMint);
+    if (inputRow) {
+      inputBalanceExact = inputRow.amountExact?.trim().replace(/,/g, '') || undefined;
+      inputDecimals = inputRow.decimals;
+      closeInputAta = isVybeFullSplSellAmount(
+        params.amountUi,
+        inputRow,
+        params.maxSellSelected === true,
+      );
+      if (closeInputAta && inputBalanceExact) {
+        amountUi = Number(maxSwapInputStringForWalletItem(inputRow));
+      }
+    } else {
+      closeInputAta = false;
+    }
+  }
+
+  let createOutputAta: boolean | undefined;
+  if (!isSolMint(outputMint) && outputMint !== WSOL_MINT) {
+    createOutputAta = !walletHasMintInSession(outputMint);
+  }
+
+  return {
+    closeWsolAta,
+    createOutputAta,
+    amountUi,
+    closeInputAta,
+    inputBalanceExact,
+    inputDecimals,
+  };
+}
+
+/** @deprecated Renamed to buildSwapAtaHintsFromSessionBalances */
+export const buildSwapAtaHintsFromWalletCache = buildSwapAtaHintsFromSessionBalances;
+
+/** True when a fresh wallet balance fetch has completed for this wallet in the current session. */
+export function hasSessionWalletBalances(wallet: string): boolean {
+  const w = wallet.trim();
+  return Boolean(w && sessionWalletBalances && sessionWalletBalances.wallet === w);
+}
+
+/** @deprecated Renamed to hasSessionWalletBalances */
+export const isWalletBalanceCacheReady = hasSessionWalletBalances;
+
+export function getWalletTotalBalanceUsd(): number | null {
+  if (!sessionWalletBalances?.items.length) return null;
+  let total = 0;
+  for (const item of sessionWalletBalances.items) {
+    const v = walletItemValueUsd(item);
+    if (Number.isFinite(v) && v > 0) total += v;
+  }
+  return total;
+}
+
+export function formatWalletTotalUsd(total: number | null): string {
+  if (total == null) return '—';
+  if (!Number.isFinite(total) || total <= 0) return '$0.00';
+  if (total < SPL_MIN_TRADABLE_VALUE_USD) return '< $0.01';
+  return `$${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+export type WalletSellableOptions = {
+  /** When `vybe`, SPL max sell uses full wallet balance; aggregators leave ~2% fee headroom. */
+  router?: string;
+};
+
+function usesFullSplBalanceForMaxSell(router?: string): boolean {
+  return router?.trim().toLowerCase() === 'vybe';
+}
+
+export function computeWalletSellableAmountUi(
+  total: number,
+  mint: string,
+  valueUsd?: number | null,
+  options?: WalletSellableOptions,
+): number | null {
+  if (!Number.isFinite(total) || total <= 0) return null;
+  if (isWsolMint(mint)) return null;
+  if (isNativeSolMint(mint)) {
+    if (total < SOL_MIN_TRADABLE_TOTAL_UI) return null;
+    const sellable = total - SOL_WALLET_MIN_RESERVE_UI;
+    return sellable > 0 ? sellable : null;
+  }
+  if (valueUsd != null && !isSplValueTradable(valueUsd)) return null;
+  if (usesFullSplBalanceForMaxSell(options?.router)) {
+    return total;
+  }
+  const learned = getSplMaxSellFraction(mint);
+  if (learned != null && learned > 0 && learned < 1) {
+    const sellable = total * learned;
+    return sellable > 0 ? sellable : null;
+  }
+  /* Default max sell leaves ~2% for input-side protocol fees (100% button still reads 100%). */
+  const sellable = computeSplSellAmountForRetryStep(total, 1);
+  return sellable > 0 ? sellable : null;
+}
+
+/** Max sellable UI amount (SOL reserve for native SOL; router-dependent for SPL). */
+export function getWalletSellableAmountUi(mint: string, options?: WalletSellableOptions): number | null {
+  const item = getWalletBalanceListItem(mint);
+  if (item == null || !(item.amountUi > 0)) return null;
+  return computeWalletSellableAmountUi(item.amountUi, mint, walletItemValueUsd(item), options);
+}
+
+export function isWalletTokenTradable(mint: string): boolean {
+  if (isBlockedPickerMint(mint)) return false;
+  return getWalletSellableAmountUi(mint) != null;
+}
+
+/** Persist wallet row metadata (symbol/name/logo/decimals) — never amounts or USD values. */
+export function persistWalletBalanceMetadata(items: WalletBalanceListItem[]): void {
+  for (const item of items) {
+    saveTokenMeta(walletItemToTokenMeta(item));
+  }
+}
+
+/** @deprecated Renamed to persistWalletBalanceMetadata */
+export const saveWalletBalanceItemsToCache = persistWalletBalanceMetadata;
+
+export function getSessionWalletBalanceItems(): readonly WalletBalanceListItem[] {
+  return sessionWalletBalances?.items ?? [];
+}
+
+/** @deprecated Renamed to getSessionWalletBalanceItems */
+export const getCachedWalletBalanceItems = getSessionWalletBalanceItems;
+
+function renderWalletBalancesLoading(): string {
+  return `<div class="token-picker-wallet-loading" aria-live="polite">
+    <span class="token-picker-wallet-loading-spinner" aria-hidden="true"></span>
+    <span>Loading wallet tokens…</span>
+  </div>`;
+}
+
+function walletItemMatchesQuery(item: WalletBalanceListItem, query: string): boolean {
+  const q = query.toLowerCase();
+  const token = walletItemToTokenMeta(item);
+  return (
+    token.symbol.toLowerCase().includes(q) ||
+    token.name.toLowerCase().includes(q) ||
+    item.mintAddress.toLowerCase().includes(q)
+  );
+}
+
+export function refreshWalletBalancesPanel(): void {
+  if (!walletBalancesEl || !walletBalancesListEl) return;
+  syncWalletBalancesVisibility();
+  if (walletBalancesEl.hidden) return;
+  const wallet = getWalletAddressCb?.().trim() ?? '';
+  if (!wallet) {
+    walletBalancesEl.hidden = true;
+    return;
+  }
+  if (activeTab === 'wallet') showWalletBalancesTab();
+  if (activeSide === 'input' && dialogEl?.open) renderShortcuts();
+}
+
+function showWalletBalancesTab(): void {
+  if (!walletBalancesEl || !walletBalancesListEl) return;
+  syncWalletBalancesVisibility();
+  if (walletBalancesEl.hidden) return;
+
+  const wallet = getWalletAddressCb?.().trim() ?? '';
+  if (!wallet) {
+    walletBalancesEl.hidden = true;
+    return;
+  }
+
+  if (getWalletHoldingsFetchingCb?.() || refetchHoldingsInFlight) {
+    walletBalancesListEl.innerHTML = renderWalletBalancesLoading();
+    return;
+  }
+
+  if (renderSessionWalletBalances()) return;
+
+  walletBalancesListEl.innerHTML =
+    '<div class="token-picker-wallet-empty">No holdings loaded yet.</div>';
+}
+
+function renderSessionWalletBalances(): boolean {
+  const wallet = getWalletAddressCb?.().trim() ?? '';
+  if (!wallet || !sessionWalletBalances || sessionWalletBalances.wallet !== wallet) return false;
+  renderWalletListHtml(sessionWalletBalances.items);
+  return true;
+}
+
+function setRefetchHoldingsTimerVisible(visible: boolean, durationSec?: number): void {
+  if (!refetchHoldingsBtn || !refetchHoldingsTimerEl) return;
+  refetchHoldingsTimerEl.hidden = !visible;
+  refetchHoldingsBtn.classList.toggle('swap-action-btn--cooldown', visible);
+  if (!visible) return;
+  const progress = refetchHoldingsTimerEl.querySelector(
+    '.swap-action-btn__timer-progress',
+  ) as SVGCircleElement | null;
+  if (progress && typeof durationSec === 'number' && Number.isFinite(durationSec)) {
+    progress.style.animation = 'none';
+    void progress.getBoundingClientRect();
+    progress.style.setProperty('--swap-action-timer-duration', `${durationSec}s`);
+    progress.style.animation = '';
+  }
+}
+
+function clearRefetchHoldingsCooldown(): void {
+  cancelAnimationFrame(refetchHoldingsCooldownRaf);
+  refetchHoldingsCooldownRaf = 0;
+  refetchHoldingsCooldownEndsAt = 0;
+  setRefetchHoldingsTimerVisible(false);
+}
+
+function isRefetchHoldingsInCooldown(): boolean {
+  return refetchHoldingsCooldownEndsAt > performance.now();
+}
+
+function tickRefetchHoldingsCooldown(now: number): void {
+  if (!refetchHoldingsBtn || refetchHoldingsCooldownEndsAt <= 0) return;
+  const remainMs = refetchHoldingsCooldownEndsAt - now;
+  if (remainMs <= 0) {
+    clearRefetchHoldingsCooldown();
+    syncRefetchHoldingsBtn();
+    return;
+  }
+  const label = refetchHoldingsTimerEl?.querySelector('.swap-action-btn__timer-label');
+  if (label) label.textContent = String(Math.max(1, Math.ceil(remainMs / 1000)));
+  refetchHoldingsCooldownRaf = requestAnimationFrame(() =>
+    tickRefetchHoldingsCooldown(performance.now()),
+  );
+}
+
+function startRefetchHoldingsCooldown(): void {
+  if (!refetchHoldingsBtn || !refetchHoldingsTimerEl) return;
+  const durationSec = REFETCH_HOLDINGS_COOLDOWN_SEC;
+  refetchHoldingsCooldownEndsAt = performance.now() + durationSec * 1000;
+  const label = refetchHoldingsTimerEl.querySelector('.swap-action-btn__timer-label');
+  if (label) label.textContent = String(durationSec);
+  setRefetchHoldingsTimerVisible(true, durationSec);
+  refetchHoldingsBtn.disabled = true;
+  cancelAnimationFrame(refetchHoldingsCooldownRaf);
+  refetchHoldingsCooldownRaf = requestAnimationFrame(() =>
+    tickRefetchHoldingsCooldown(performance.now()),
+  );
+}
+
+export function syncRefetchHoldingsBtn(): void {
+  if (!refetchHoldingsBtn) return;
+  const showRefetch = activeSide === 'input' || activeTab === 'wallet';
+  refetchHoldingsBtn.hidden = !showRefetch;
+  if (!showRefetch) return;
+  const wallet = getWalletAddressCb?.().trim() ?? '';
+  const inCooldown = isRefetchHoldingsInCooldown();
+  const fetching = getWalletHoldingsFetchingCb?.() ?? false;
+  refetchHoldingsBtn.disabled =
+    !wallet || inCooldown || fetching || refetchHoldingsInFlight;
+}
+
+async function onRefetchHoldingsClick(): Promise<void> {
+  if (isRefetchHoldingsInCooldown() || refetchHoldingsInFlight) return;
+  const wallet = getWalletAddressCb?.().trim() ?? '';
+  if (!wallet) return;
+
+  clearWalletEnrichGiveUp();
+  startRefetchHoldingsCooldown();
+  refetchHoldingsInFlight = true;
+  syncRefetchHoldingsBtn();
+
+  if (activeTab === 'wallet' && walletBalancesListEl) {
+    walletBalancesListEl.innerHTML = renderWalletBalancesLoading();
+  }
+
+  try {
+    await onRefetchHoldingsCb?.();
+  } finally {
+    refetchHoldingsInFlight = false;
+    syncRefetchHoldingsBtn();
+    if (activeTab === 'wallet') showWalletBalancesTab();
+  }
+}
+
+function renderWalletListHtml(items: WalletBalanceListItem[]): void {
+  if (!walletBalancesListEl) return;
+  const q = searchQuery.trim();
+  let visible = q ? items.filter((item) => walletItemMatchesQuery(item, q)) : items;
+  if (activeSide === 'output' && isBuyOutputPickerRestricted()) {
+    visible = visible.filter((item) => isSolOrStableMint(item.mintAddress, item.symbol));
+  }
+  const sorted =
+    activeSide === 'input'
+      ? sortWalletBalancesForSellPicker(visible)
+      : sortWalletBalancesForDisplay(visible);
+  if (sorted.length === 0) {
+    walletBalancesListEl.innerHTML = q
+      ? '<div class="token-picker-wallet-empty">No wallet tokens match your search.</div>'
+      : '<div class="token-picker-wallet-empty">Wallet does not contain any tokens</div>';
+    return;
+  }
+  walletBalancesListEl.innerHTML = sorted.map(renderWalletBalanceRow).join('');
+  hydrateTokenIconImgs(walletBalancesListEl);
+}
+
+/** Sell picker: token has ≥ $0.01 wallet balance (or SOL reserve rules). Buy picker: always true. */
+type SellPickerWalletState = 'tradable' | 'too_small' | 'not_in_wallet' | 'unknown' | 'blocked';
+
+function getSellPickerWalletState(mint: string): SellPickerWalletState {
+  if (activeSide !== 'input') return 'tradable';
+  const wallet = getWalletAddressCb?.().trim() ?? '';
+  if (!wallet || !sessionWalletBalances) return 'unknown';
+
+  const swapMint = mint.trim();
+  const item = getWalletBalanceListItem(swapMint);
+  if (isBlockedPickerMint(swapMint)) {
+    if (!item || !(item.amountUi > 0)) return 'not_in_wallet';
+    return 'blocked';
+  }
+  if (!item || !(item.amountUi > 0)) return 'not_in_wallet';
+  if (isWalletTokenTradable(swapMint)) return 'tradable';
+  return 'too_small';
+}
+
+function isSellPickerMintTradable(mint: string): boolean {
+  if (isBlockedPickerMint(mint)) return false;
+  const state = getSellPickerWalletState(mint);
+  return state === 'tradable' || state === 'unknown';
+}
+
+function sellPickerWalletStateTag(state: SellPickerWalletState): string {
+  if (state === 'too_small') {
+    return '<span class="token-picker-row-tag token-picker-row-tag--muted">Too small</span>';
+  }
+  if (state === 'not_in_wallet') {
+    return '<span class="token-picker-row-tag token-picker-row-tag--muted">Not in wallet</span>';
+  }
+  return '';
+}
+
+function tokenWalletValueUsd(mint: string): number {
+  const item = getWalletBalanceListItem(mint);
+  return item ? walletItemValueUsd(item) : 0;
+}
+
+function sortTokensForSellPicker(tokens: TokenMeta[]): TokenMeta[] {
+  const ranked: TokenMeta[] = [];
+  const tooSmall: TokenMeta[] = [];
+  const notInWallet: TokenMeta[] = [];
+  for (const token of tokens) {
+    const state = getSellPickerWalletState(token.mint);
+    if (state === 'tradable' || state === 'unknown' || state === 'blocked') ranked.push(token);
+    else if (state === 'too_small') tooSmall.push(token);
+    else notInWallet.push(token);
+  }
+  ranked.sort((a, b) => tokenWalletValueUsd(b.mint) - tokenWalletValueUsd(a.mint));
+  return [...ranked, ...tooSmall, ...notInWallet];
+}
+
+function shouldDemoteWalletBalanceInSort(mint: string): boolean {
+  if (isBlockedPickerMint(mint)) return false;
+  return !isWalletTokenTradable(mint);
+}
+
+function sortWalletBalancesForSellPicker(items: WalletBalanceListItem[]): WalletBalanceListItem[] {
+  return sortWalletBalanceList(items, { demoteUntradableSell: true });
+}
+
+function renderTokenRow(token: TokenMeta): string {
+  const blocked = isBlockedPickerMint(token.mint);
+  const walletState = activeSide === 'input' ? getSellPickerWalletState(token.mint) : 'tradable';
+  const untradable =
+    blocked ||
+    (activeSide === 'input' && walletState !== 'tradable' && walletState !== 'unknown');
+  const tagHtml =
+    token.tags?.includes('Token2022')
+      ? '<span class="token-picker-row-tag">Token2022</span>'
+      : '';
+  const statusTag = blocked
+    ? '<span class="token-picker-row-tag token-picker-row-tag--muted">Use SOL</span>'
+    : activeSide === 'input'
+      ? sellPickerWalletStateTag(walletState)
+      : '';
+  const score =
+    token.organicScore != null && Number.isFinite(token.organicScore)
+      ? `<span class="token-picker-row-score"><span class="token-picker-row-score-leaf" aria-hidden="true"></span>${Math.round(token.organicScore)}</span>`
+      : '';
+  const verified =
+    token.isVerified !== false
+      ? '<span class="token-picker-row-verified" aria-hidden="true"><span class="token-picker-row-verified-check"></span></span>'
+      : '';
+  const disabledAttr = untradable ? ' disabled aria-disabled="true"' : '';
+  const untradableClass = untradable ? ' token-picker-row--untradable' : '';
+  return `<button type="button" class="token-picker-row${untradableClass}" data-mint="${escapeHtml(token.mint)}"${disabledAttr}>
+    <span class="token-picker-row-logo">${renderTokenIcon(token)}</span>
+    <span class="token-picker-row-main">
+      <span class="token-picker-row-title">
+        <span class="token-picker-row-symbol">${escapeHtml(token.symbol)}</span>
+        ${statusTag}
+        ${verified}
+        ${score}
+      </span>
+      <span class="token-picker-row-sub">${escapeHtml(token.name)} · ${escapeHtml(truncateMint(token.mint))}</span>
+    </span>
+    ${tagHtml}
+  </button>`;
+}
+
+const SHORTCUT_MINTS = [
+  '11111111111111111111111111111111',
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  '27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4',
+  'JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD',
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+];
+
+const BUY_EXIT_SHORTCUT_MINTS = [
+  NATIVE_SOL_MINT,
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+];
+
+function tokenMetaFromMint(mint: string): TokenMeta | null {
+  return catalogTokens.find((t) => t.mint === mint) ?? readCache()[mint] ?? null;
+}
+
+/** Sell picker shortcuts: wallet tokens ≥ $0.01, recent-first when still tradable. */
+function getSellPickerShortcutTokens(): TokenMeta[] {
+  const wallet = getWalletAddressCb?.().trim() ?? '';
+  if (!wallet || !sessionWalletBalances || sessionWalletBalances.wallet !== wallet) return [];
+
+  const tradableItems = sessionWalletBalances.items.filter((item) =>
+    isWalletTokenTradable(item.mintAddress),
+  );
+  const tradableByMint = new Map(tradableItems.map((item) => [item.mintAddress, item]));
+  const orderedMints: string[] = [];
+  const seen = new Set<string>();
+
+  for (const mint of readRecent()) {
+    const item = getWalletBalanceListItem(mint);
+    if (!item || !isWalletTokenTradable(item.mintAddress) || seen.has(item.mintAddress)) continue;
+    seen.add(item.mintAddress);
+    orderedMints.push(item.mintAddress);
+  }
+
+  for (const item of sortWalletBalancesForSellPicker(tradableItems)) {
+    if (seen.has(item.mintAddress)) continue;
+    seen.add(item.mintAddress);
+    orderedMints.push(item.mintAddress);
+  }
+
+  return orderedMints
+    .map((mint) => {
+      const item = tradableByMint.get(mint);
+      return item ? walletItemToTokenMeta(item) : null;
+    })
+    .filter((t): t is TokenMeta => Boolean(t));
+}
+
+function renderShortcuts(): void {
+  if (!shortcutsEl) return;
+  let tokens: TokenMeta[];
+  if (activeSide === 'input') {
+    tokens = getSellPickerShortcutTokens();
+    shortcutsEl.hidden = tokens.length === 0;
+    if (tokens.length === 0) {
+      shortcutsEl.innerHTML = '';
+      return;
+    }
+  } else if (isBuyOutputPickerRestricted()) {
+    shortcutsEl.hidden = false;
+    tokens = BUY_EXIT_SHORTCUT_MINTS.map((mint) => tokenMetaFromMint(mint)).filter(
+      (t): t is TokenMeta => Boolean(t),
+    );
+  } else {
+    shortcutsEl.hidden = false;
+    const picks = SHORTCUT_MINTS.map((mint) => tokenMetaFromMint(mint)).filter(
+      (t): t is TokenMeta => Boolean(t),
+    );
+    const fallback = catalogTokens.slice(0, 6);
+    tokens = picks.length > 0 ? picks : fallback;
+  }
+  const ordered = tokens;
+  const leadMint =
+    activeSide === 'input'
+      ? ordered.find((t) => isSellPickerMintTradable(t.mint))?.mint
+      : ordered[0]?.mint;
+  shortcutsEl.innerHTML = ordered
+    .map((t) => {
+      const untradable =
+        isBlockedPickerMint(t.mint) ||
+        (activeSide === 'input' && !isSellPickerMintTradable(t.mint));
+      const lead = t.mint === leadMint ? ' token-picker-shortcut--lead' : '';
+      const untradableClass = untradable ? ' token-picker-shortcut--untradable' : '';
+      const disabled = untradable ? ' disabled aria-disabled="true"' : '';
+      const iconSrc = effectiveTokenIconSrc(resolveTokenLogoUrl(t.mint) ?? t.logoUrl);
+      const iconHtml = renderTokenIconImgHtml(iconSrc, '', `${t.symbol || 'Token'} logo`);
+      return `<button type="button" class="token-picker-shortcut${lead}${untradableClass}" data-mint="${escapeHtml(t.mint)}" title="${escapeHtml(t.symbol)}"${disabled}>
+          ${iconHtml}
+        </button>`;
+    })
+    .join('');
+  hydrateTokenIconImgs(shortcutsEl);
+}
+
+function setStatus(msg: string): void {
+  if (statusEl) statusEl.textContent = msg;
+}
+
+function renderList(): void {
+  if (!listEl) return;
+  if (activeSide === 'input' || (activeTab === 'wallet' && !isPickerSearchActive())) {
+    listEl.innerHTML = '';
+    return;
+  }
+  const tokens = getVisibleTokens();
+  if (tokens.length === 0) {
+    const q = searchQuery.trim();
+    if (BASE58_RE.test(q) && pendingMintLookup === q) {
+      listEl.innerHTML = '<div class="token-picker-empty">Looking up token…</div>';
+      return;
+    }
+    if (BASE58_RE.test(q)) {
+      listEl.innerHTML = '<div class="token-picker-empty">No token found for that address.</div>';
+      return;
+    }
+    listEl.innerHTML = `<div class="token-picker-empty">${q ? (isBuyOutputPickerRestricted() ? 'When selling this token, output must be SOL or a stablecoin.' : 'No tokens match your search.') : 'No tokens to show.'}</div>`;
+    return;
+  }
+  listEl.innerHTML = tokens.map(renderTokenRow).join('');
+  hydrateTokenIconImgs(listEl);
+  scheduleRecentMetaRefresh();
+}
+
+function syncTabs(): void {
+  document.querySelectorAll('.token-picker-tab').forEach((el) => {
+    const tab = (el as HTMLElement).dataset.tab;
+    el.classList.toggle('token-picker-tab--active', tab === activeTab);
+  });
+}
+
+function selectToken(mint: string): void {
+  if (isBlockedPickerMint(mint)) return;
+  if (!isAllowedBuyOutputMint(mint)) return;
+  const walletItem = sessionWalletBalances?.items.find((i) => i.mintAddress === mint);
+  if (walletItem) {
+    saveTokenMeta(walletItemToTokenMeta(walletItem));
+  } else {
+    const fromCatalog = catalogTokens.find((t) => t.mint === mint);
+    const cached = readCache()[mint];
+    const meta = fromCatalog ?? cached;
+    if (meta) saveTokenMeta({ ...meta, savedAt: Date.now() });
+  }
+  onSelectCb?.(mint, activeSide);
+  closeTokenPicker();
+}
+
+export function openTokenPicker(side: TokenPickerSide): void {
+  if (!dialogEl) return;
+  if (side === 'input' && canOpenSellPickerCb && !canOpenSellPickerCb()) return;
+  if (side === 'output' && canOpenBuyPickerCb && !canOpenBuyPickerCb()) return;
+  activeSide = side;
+  activeTab = side === 'input' ? 'wallet' : 'top';
+  searchQuery = '';
+  pendingMintLookup = null;
+  if (searchInputEl) searchInputEl.value = '';
+  syncPickerLayout();
+  renderShortcuts();
+  if (activeTab === 'wallet') showWalletBalancesTab();
+  renderList();
+  setStatus('');
+  if (typeof dialogEl.showModal === 'function') dialogEl.showModal();
+  else dialogEl.setAttribute('open', '');
+  lockPageScroll();
+  requestAnimationFrame(() => {
+    if (!searchWrapEl?.hidden) searchInputEl?.focus();
+  });
+}
+
+export function closeTokenPicker(): void {
+  if (!dialogEl) return;
+  pendingMintLookup = null;
+  if (typeof dialogEl.close === 'function') dialogEl.close();
+  else dialogEl.removeAttribute('open');
+  unlockPageScroll();
+}
+
+async function onSearchInput(): Promise<void> {
+  if (!searchInputEl) return;
+  searchQuery = searchInputEl.value;
+
+  if (activeSide === 'input') {
+    renderList();
+    syncPickerLayout();
+    showWalletBalancesTab();
+    return;
+  }
+
+  const q = searchQuery.trim();
+
+  if (BASE58_RE.test(q)) {
+    const cache = readCache();
+    const catalogHit = catalogTokens.find((t) => t.mint === q);
+    if (!catalogHit && !cache[q] && pendingMintLookup !== q) {
+      pendingMintLookup = q;
+      renderList();
+      const fetched = await fetchTokenByMint(q);
+      pendingMintLookup = null;
+      if (fetched && searchInputEl.value.trim() === q) {
+        renderList();
+        return;
+      }
+    }
+  }
+
+  renderList();
+  syncPickerLayout();
+  if (activeTab === 'wallet') showWalletBalancesTab();
+}
+
+function debouncedSearch(): void {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => void onSearchInput(), 220);
+}
+
+export function initTokenPicker(options: {
+  onSelect: (mint: string, side: TokenPickerSide) => void;
+  getWalletAddress?: () => string;
+  getSwapInputMint?: () => string;
+  getSwapInputSymbol?: () => string;
+  canOpenSellPicker?: () => boolean;
+  canOpenBuyPicker?: () => boolean;
+  onRefetchHoldings?: () => void | Promise<void>;
+  isWalletHoldingsFetching?: () => boolean;
+}): void {
+  ensureTokenIconErrorHandling();
+  onSelectCb = options.onSelect;
+  getWalletAddressCb = options.getWalletAddress ?? null;
+  getSwapInputMintCb = options.getSwapInputMint ?? null;
+  getSwapInputSymbolCb = options.getSwapInputSymbol ?? null;
+  canOpenSellPickerCb = options.canOpenSellPicker ?? null;
+  canOpenBuyPickerCb = options.canOpenBuyPicker ?? null;
+  onRefetchHoldingsCb = options.onRefetchHoldings ?? null;
+  getWalletHoldingsFetchingCb = options.isWalletHoldingsFetching ?? null;
+  dialogEl = document.getElementById('tokenPickerDialog') as HTMLDialogElement | null;
+  searchInputEl = document.getElementById('tokenPickerSearch') as HTMLInputElement | null;
+  listEl = document.getElementById('tokenPickerList');
+  shortcutsEl = document.getElementById('tokenPickerShortcuts');
+  walletBalancesEl = document.getElementById('tokenPickerWalletBalances');
+  walletBalancesListEl = document.getElementById('tokenPickerWalletBalancesList');
+  tabsEl = document.querySelector('.token-picker-tabs');
+  refetchHoldingsBtn = document.getElementById('tokenPickerRefetchHoldings') as HTMLButtonElement | null;
+  refetchHoldingsTimerEl = document.getElementById('tokenPickerRefetchHoldingsTimer');
+  listWrapEl = document.querySelector('.token-picker-list-wrap');
+  listHeadEl = document.getElementById('tokenPickerListHead');
+  searchWrapEl = document.querySelector('.token-picker-search-wrap');
+  walletTabEl = document.querySelector('.token-picker-tab[data-tab="wallet"]');
+  topTabEl = document.querySelector('.token-picker-tab[data-tab="top"]');
+  statusEl = document.getElementById('tokenPickerStatus');
+
+  refetchHoldingsBtn?.addEventListener('click', () => void onRefetchHoldingsClick());
+  syncRefetchHoldingsBtn();
+
+  void loadCatalog().then(() => {
+    renderShortcuts();
+    if (dialogEl?.open) renderList();
+  });
+
+  document.getElementById('tokenPickerClose')?.addEventListener('click', () => closeTokenPicker());
+  document.getElementById('tokenPickerEsc')?.addEventListener('click', () => closeTokenPicker());
+
+  searchInputEl?.addEventListener('input', debouncedSearch);
+  searchInputEl?.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeTokenPicker();
+    }
+  });
+
+  document.querySelectorAll('.token-picker-tab').forEach((el) => {
+    el.addEventListener('click', () => {
+      const tab = (el as HTMLElement).dataset.tab;
+      if ((tab === 'top' || tab === 'recent') && activeSide === 'input') return;
+      if (tab === 'top' || tab === 'recent' || tab === 'wallet') {
+        activeTab = tab;
+        syncPickerLayout();
+        if (tab === 'wallet') showWalletBalancesTab();
+        if (tab !== 'wallet' || isPickerSearchActive()) renderList();
+      }
+    });
+  });
+
+  listEl?.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.token-picker-row');
+    if (!btn?.dataset.mint || btn.disabled) return;
+    selectToken(btn.dataset.mint);
+  });
+
+  walletBalancesListEl?.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.token-picker-row--wallet');
+    if (!btn?.dataset.mint || btn.disabled) return;
+    selectToken(btn.dataset.mint);
+  });
+
+  shortcutsEl?.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.token-picker-shortcut');
+    if (!btn?.dataset.mint || btn.disabled) return;
+    selectToken(btn.dataset.mint);
+  });
+
+  dialogEl?.addEventListener('click', (e) => {
+    if (e.target === dialogEl) closeTokenPicker();
+  });
+
+  dialogEl?.addEventListener('close', () => {
+    pendingMintLookup = null;
+    unlockPageScroll();
+  });
+
+  dialogEl?.addEventListener('wheel', preventBackgroundScroll, { passive: false });
+  dialogEl?.addEventListener('touchmove', preventBackgroundScroll, { passive: false });
+}
+
+export async function ensureTokenCatalogLoaded(): Promise<void> {
+  await loadCatalog();
+}
+
+const pendingMetaFetches = new Map<string, Promise<TokenMeta | null>>();
+
+export async function ensureTokenMetaForMint(mint: string): Promise<TokenMeta | null> {
+  await loadCatalog();
+  const m = mint.trim();
+  if (!m) return null;
+  const existing = getCachedTokenMeta(m);
+  if (existing && !needsRemoteLogoResolve(existing)) return existing;
+  const pending = pendingMetaFetches.get(m);
+  if (pending) return pending;
+  const promise = (async (): Promise<TokenMeta | null> => {
+    if (BASE58_RE.test(m)) {
+      const fetched = await fetchTokenByMint(m);
+      return fetched ?? existing ?? null;
+    }
+    return existing;
+  })().finally(() => {
+    pendingMetaFetches.delete(m);
+  });
+  pendingMetaFetches.set(m, promise);
+  return promise;
+}
+
+export async function prefetchTokenMetas(mints: string[]): Promise<void> {
+  await loadCatalog();
+  const uniq = [...new Set(mints.map((mint) => mint.trim()).filter(Boolean))];
+  await Promise.all(uniq.map((mint) => ensureTokenMetaForMint(mint)));
+}
+
+export function renderChipTokenIcon(el: HTMLElement | null, mint: string | undefined, fallbackDotClass: string): void {
+  if (!el) return;
+  const src = effectiveTokenIconSrc(resolveTokenLogoUrl(mint));
+  if (src === TOKEN_ICON_PLACEHOLDER_PATH) {
+    el.className = `swap-token-chip-icon ${fallbackDotClass}`;
+    el.innerHTML = '';
+    return;
+  }
+  el.className = 'swap-token-chip-icon swap-token-chip-icon--logo';
+  const meta = getCachedTokenMeta(mint?.trim() ?? '');
+  el.innerHTML = renderTokenIconImgHtml(src, '', `${meta?.symbol || 'Token'} logo`);
+  const img = el.querySelector('img');
+  if (img) bindTokenIconImg(img);
+}

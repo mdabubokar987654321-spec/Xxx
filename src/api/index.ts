@@ -1,0 +1,79 @@
+/**
+ * Vybe API client: single entry point wiring the API modules.
+ */
+
+import { createTradingHttpClient, createDataHttpClient } from './client.js';
+import { getToken } from './tokens.js';
+import { getSwapQuote, type GetSwapQuoteParams } from './swap-quote.js';
+import { buildSwap, buildSwapWithFallback, type BuildSwapParams, type SwapProxyRouter } from './swap-build.js';
+import { resolveTokenPrices, type ResolveTokenPricesOptions } from './resolve-token-prices.js';
+import { buildVybeQuoteFromPriceAndSwap, type VybeQuoteParams, type VybeQuoteResult } from './vybe-swap-quote.js';
+import {
+  assertWalletHasSellAmount,
+  getWalletTokenBalance,
+  listWalletTokenBalances,
+  type GetWalletTokenBalanceParams,
+  type WalletBalanceListItem,
+} from './wallet-balance.js';
+import {
+  evaluateLowSolTradeWarning,
+  type LowSolTradeWarningResult,
+} from './trade-sol-warning.js';
+import type { VybeToken } from '../types/api.js';
+import type { VybeSwapQuote, VybeSwapBuildResponse } from '../types/swap.js';
+import type { ResolveTokenPricesResult } from './resolve-token-prices.js';
+
+export type {
+  GetSwapQuoteParams,
+  BuildSwapParams,
+  SwapProxyRouter,
+  VybeQuoteParams,
+  VybeQuoteResult,
+  GetWalletTokenBalanceParams,
+  WalletBalanceListItem,
+  LowSolTradeWarningResult,
+};
+
+export interface VybeClient {
+  getToken(mintAddress: string): Promise<VybeToken>;
+  getSwapQuote(params: GetSwapQuoteParams): Promise<VybeSwapQuote>;
+  buildSwap(body: BuildSwapParams): Promise<VybeSwapBuildResponse>;
+  buildSwapWithFallback(body: BuildSwapParams): Promise<VybeSwapBuildResponse>;
+  resolveTokenPrices(mints: string[], options?: ResolveTokenPricesOptions): Promise<ResolveTokenPricesResult>;
+  buildVybeQuote(params: VybeQuoteParams): Promise<VybeQuoteResult>;
+  getWalletTokenBalance(params: GetWalletTokenBalanceParams): Promise<
+    import('../types/api.js').VybeWalletTokenBalanceResponse
+  >;
+  assertWalletHasSellAmount(
+    ownerAddress: string,
+    inputMint: string,
+    amountUi: number,
+    symbolHint?: string,
+  ): Promise<void>;
+  listWalletTokenBalances(ownerAddress: string, limit?: number): Promise<WalletBalanceListItem[]>;
+  evaluateLowSolTradeWarning(params: {
+    ownerAddress: string;
+    inputMint: string;
+    outputMint?: string;
+    gasless: boolean;
+  }): Promise<LowSolTradeWarningResult>;
+}
+
+export function createClient(tradingApiKey: string, dataApiKey: string): VybeClient {
+  const tradingHttp = createTradingHttpClient(tradingApiKey);
+  const dataHttp = createDataHttpClient(dataApiKey);
+  return {
+    getToken: (mintAddress: string) => getToken(dataHttp, mintAddress),
+    getSwapQuote: (params: GetSwapQuoteParams) => getSwapQuote(tradingHttp, params),
+    buildSwap: (body: BuildSwapParams) => buildSwap(tradingHttp, body),
+    buildSwapWithFallback: (body: BuildSwapParams) => buildSwapWithFallback(tradingHttp, body),
+    resolveTokenPrices: (mints, options) => resolveTokenPrices(dataHttp, mints, options),
+    buildVybeQuote: (params) => buildVybeQuoteFromPriceAndSwap(tradingHttp, params, dataHttp),
+    getWalletTokenBalance: (params) => getWalletTokenBalance(dataHttp, params),
+    assertWalletHasSellAmount: (ownerAddress, inputMint, amountUi, symbolHint) =>
+      assertWalletHasSellAmount(dataHttp, ownerAddress, inputMint, amountUi, symbolHint),
+    listWalletTokenBalances: (ownerAddress, limit) =>
+      listWalletTokenBalances(dataHttp, ownerAddress, limit),
+    evaluateLowSolTradeWarning: (params) => evaluateLowSolTradeWarning(dataHttp, params),
+  };
+}

@@ -1,0 +1,11 @@
+# SOL-buy filter failures — debug list
+# Filtered: 2026-07-04T00:46:26.629Z
+# Quote: token-balances + resolve-prices → vybe-quote
+# Columns: mint	symbol	reason	solscanEligible	solPairEligible	eligibleRank	eligibleTotal	selectedTvlUsd	assessment
+5Y8NV33Vv7WbnLfq3zBcKSdYPrk7g2KoiQoe7M2tcxp5	ONyc	DAMM2 zero on-chain liquidity						
+7GxATsNMnaC88vdwd2t3mwrFuQwwGvmYPrUQ4D6FotXk	JUICED	Failed to build DLMM swap: Insufficient liquidity in binArrays for swapQuote						
+star9agSpjiFe3M49B3RniVU4CMBBEK3Qnaqn3RGiFM	USD*	DAMM2 zero on-chain liquidity						
+3AJYCjrhKitmBd8tRUurPA5dGHCAQh6A8L9DkuSC37Rm	USD*-J	DAMM2 zero on-chain liquidity						
+9fvHrYNw1A8Evpcj7X2yy4k4fT7nNHcA9L6UsamNHAif	jlUSDG	DAMM2 zero on-chain liquidity						
+3ThdFZQKM6kRyVGLG48kaPg5TRMhYMKY1iCRa9xop1WC	eUSX	DAMM2 zero on-chain liquidity						
+j14XLJZSVMcUYpAfajdZRpnfHUpJieZHS4aPektLWvh	jlUSDS	Invalid tick array						
